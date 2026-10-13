@@ -138,6 +138,10 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    pm_owner_reset: list[str] = field(default_factory=list)
+    """Task ids whose ``pm_owner_session_id`` was reset to ``pm-bangioi-default``
+    by :func:`hermes_cli.kanban_db.reap_stale_pm_sessions` because the owning
+    PM session went silent past ``PM_OWNER_STALENESS_SECONDS`` (Rule 14)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -2199,6 +2203,20 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # PM-owner staleness reaper (Rule 14, CEO-APPROVED 2026-10-13): any PM
+    # session whose tasks show no recent activity has its owned tasks reset
+    # to ``pm-bangioi-default`` so the next PM to act can claim them. Runs
+    # AFTER stale/orphan detection but BEFORE promote so a freshly-reset card
+    # is visible to whichever PM next calls ``kanban_list``.
+    try:
+        from hermes_cli.kanban_db import reap_stale_pm_sessions as _reap_pm
+        touched = _reap_pm(conn)
+        if touched:
+            result.pm_owner_reset = touched
+    except Exception as pm_reap_exc:  # never break dispatch on a reaper glitch
+        import logging
+        logging.getLogger(__name__).warning(
+            "pm_owner reap skipped: %r", pm_reap_exc)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

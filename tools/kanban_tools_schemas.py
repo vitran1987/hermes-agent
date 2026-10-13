@@ -559,3 +559,30 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+
+KANBAN_HANDOFF_OWNER_SCHEMA = _schema(
+    "kanban_handoff_owner",
+    (
+        "Re-point the pm_owner_session_id (and optionally pm_owner_chat_id) "
+        "of a task to a new PM session. Idempotent. Appends to "
+        "metadata.handoff_chain. Authorization: any active PM session can call "
+        "this. After handoff, the kernel routes notifications to the new owner "
+        "only; the old owner stops receiving events for this task."
+    ),
+    {
+        "task_id": {"type": "string", "description": "Task id whose ownership to transfer."},
+        "to_session_id": {
+            "type": "string",
+            "description": "Target PM session id (becomes the new pm_owner_session_id).",
+        },
+        "to_chat_id": {
+            "type": "string",
+            "description": (
+                "Optional. Target chat id for push notifications. Defaults to "
+                "to_session_id."
+            ),
+        },
+    },
+    ["task_id", "to_session_id"],
+)

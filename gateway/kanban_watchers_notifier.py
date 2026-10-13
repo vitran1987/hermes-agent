@@ -318,6 +318,26 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        # PM-ownership routing filter (Rule 15, CEO-APPROVED 2026-10-13): when
+        # the task has a non-NULL ``pm_owner_chat_id`` bound to a different
+        # chat than this subscription, this sub is NOT the PM owner and must
+        # not receive the events. The PM-owner sub (registered at create time
+        # by ``_maybe_auto_subscribe`` or by an explicit ``kanban_notify-
+        # subscribe`` for a PM session) keeps the event; the legacy / cross-
+        # session sub is silently dropped. A NULL ``pm_owner_chat_id`` (legacy
+        # card, default queue, freshly-reset reaper victim) keeps the legacy
+        # "any subscriber gets it" behaviour so we don't strand notifications
+        # for boards that haven't yet been migrated to PM ownership.
+        if task is not None:
+            owner_chat = getattr(task, "pm_owner_chat_id", None)
+            sub_chat = sub.get("chat_id") or ""
+            if owner_chat and owner_chat != sub_chat:
+                logger.debug(
+                    "kanban notifier: dropping events for %s on board %s — "
+                    "subscription chat_id=%r != pm_owner_chat_id=%r (Rule 15)",
+                    sub["task_id"], slug, sub_chat, owner_chat,
+                )
+                return None
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}

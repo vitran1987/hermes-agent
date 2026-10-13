@@ -887,6 +887,15 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # PM ownership binding (Rule 14, CEO-APPROVED 2026-10-13). NULL on existing rows.
+    # Backfill to PM_OWNER_DEFAULT is performed by the standalone backfill script
+    # (see hermes_cli/kanban_owner.py) so a zero-downtime deploy does not block on it.
+    ("pm_owner_session_id", "pm_owner_session_id TEXT"),
+    ("pm_owner_chat_id", "pm_owner_chat_id TEXT"),
+    # Free-form per-task JSON (handoff history, dashboard tags). Legacy boards
+    # without this column still work: ``handoff_owner`` falls back to stamping
+    # only the owner fields, and reads of ``tasks.metadata`` simply return None.
+    ("metadata", "metadata TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -952,6 +961,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    # PM ownership binding (Rule 14, CEO-APPROVED 2026-10-13). The reaper walks
+    # ``pm_owner_session_id`` on every dispatcher tick to find dead owners;
+    # without the index this is a full-table scan on every board.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_pm_owner_session ON tasks(pm_owner_session_id)")
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).

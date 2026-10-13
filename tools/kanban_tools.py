@@ -22,9 +22,11 @@ from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HANDOFF_OWNER_SCHEMA,
+    KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+from hermes_cli.kanban_db import PM_OWNER_DEFAULT
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +135,10 @@ _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
     "kanban_create": frozenset({"session_id", "project_id"}),
     # ``title`` is the pre-schema alias of ``filename`` that ``_handle_attach_url`` still honours.
     "kanban_attach_url": frozenset({"title"}),
+    # ``session_id`` on the handoff tool lets a caller pre-resolve its own
+    # session id before the read-side state.db lookup runs (parallel to the
+    # kanban_create convention above).
+    "kanban_handoff_owner": frozenset({"session_id"}),
 }
 
 
@@ -261,6 +267,80 @@ def _enforce_worker_task_ownership(tid: str) -> None:
         raise _Reject(
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
             f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
+
+
+def _resolve_caller_session_id(args: Optional[dict] = None) -> Optional[str]:
+    """Best-effort caller PM session id (args > origin ContextVar > env).
+
+    Used by the PM-owner mutation check to identify the live session making
+    the call. Each source is verified against the profile's ``state.db`` via
+    ``_persisted_session_id`` so a forged arg can't impersonate another
+    session; ``None`` when nothing is reachable (CLI/cron/test harness).
+    """
+    args = args or {}
+    try:
+        from tools.async_delegation import _current_origin_session_id
+    except Exception:
+        _current_origin_session_id = None
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        get_session_env = None
+    for candidate in (
+        args.get("session_id") if isinstance(args, dict) else None,
+        _current_origin_session_id() if _current_origin_session_id else None,
+        get_session_env("HERMES_SESSION_ID", "") if get_session_env else "",
+    ):
+        resolved = _persisted_session_id(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _enforce_pm_owner_mutation(task, tool_name: str) -> str:
+    """Cross-session PM-ownership guard for mutation tools (Rule 14).
+
+    Returns the caller session id when the check passes. The mutation is
+    allowed iff the caller is:
+
+      * the task's current PM owner (``task.pm_owner_session_id``); OR
+      * the default queue (``pm_owner_session_id == PM_OWNER_DEFAULT`` or NULL,
+        which means the card is open for any PM to claim).
+
+    Anything else raises ``_Reject`` with the violation message. ``tool_name``
+    is the surface the rejection names (e.g. ``"kanban_complete"``).
+    """
+    from hermes_cli.kanban_db import PM_OWNER_DEFAULT as _PM_DEFAULT
+
+    caller_sid = _resolve_caller_session_id()
+    current_owner = task.pm_owner_session_id if task else None
+    # A NULL owner (legacy / freshly-reset card) is treated as the default queue;
+    # the first PM to act on it claims it via the post-check ``handoff_owner``.
+    is_default = current_owner is None or current_owner == _PM_DEFAULT
+    is_owner = bool(caller_sid) and bool(current_owner) and caller_sid == current_owner
+    _check(
+        is_default or is_owner,
+        f"cannot mutate task not owned by this session "
+        f"(tool={tool_name}, task={task.id if task else '?'}, "
+        f"task pm_owner_session_id={current_owner!r}, caller={caller_sid!r})",
+    )
+    return caller_sid or ""
+
+
+def _claim_default_queue_if_needed(kb, conn, task, caller_sid: str) -> None:
+    """If the task is in the default queue and the caller is a real PM session,
+    claim it (auto-handoff) so subsequent reads see the new owner. No-op when
+    the task already has a non-default owner or when ``caller_sid`` is empty
+    (CLI / cron)."""
+    from hermes_cli.kanban_db import PM_OWNER_DEFAULT as _PM_DEFAULT
+    if not caller_sid:
+        return
+    current_owner = task.pm_owner_session_id if task else None
+    if current_owner is None or current_owner == _PM_DEFAULT:
+        kb.handoff_owner(
+            conn, task_id=task.id, to_session_id=caller_sid,
+            to_chat_id=caller_sid, actor=caller_sid,
+        )
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:
@@ -735,12 +815,21 @@ def _handle_complete(args: dict, **kw) -> str:
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
-    if artifacts:
-        metadata = _merge_artifacts(metadata, artifacts)
-    _check(summary or result, "provide at least one of: summary (preferred), result")
-    _require_dict_metadata(metadata)
-    metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
+        # Cross-session PM-owner check: a non-PM caller must not complete a task
+        # owned by another PM session. The default queue ("pm-bangioi-default"
+        # or NULL) is auto-claimed by the first PM to act on it.
+        owner_task = kb.get_task(conn, tid)
+        caller_sid = _enforce_pm_owner_mutation(owner_task, "kanban_complete")
+        if artifacts:
+            metadata = _merge_artifacts(metadata, artifacts)
+        _check(summary or result, "provide at least one of: summary (preferred), result")
+        _require_dict_metadata(metadata)
+        metadata = _stamp_worker_session_metadata(tid, metadata)
+        # Auto-claim default-queue cards so the closure event's notification
+        # routes to the PM that did the work (not the default queue, which has
+        # no listener). No-op when caller_sid is empty (CLI / cron).
+        _claim_default_queue_if_needed(kb, conn, owner_task, caller_sid)
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
@@ -818,6 +907,11 @@ def _handle_block(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+        # Cross-session PM-owner check (Rule 14): a non-PM caller cannot block
+        # a task owned by another PM session; default queue auto-claims.
+        owner_task = kb.get_task(conn, tid)
+        caller_sid = _enforce_pm_owner_mutation(owner_task, "kanban_block")
+        _claim_default_queue_if_needed(kb, conn, owner_task, caller_sid)
         # The goal loop treats ANY blocked status as terminal, so kanban_block
         # would be an escape hatch around the completion judge: goal_mode tasks
         # may only block on genuine external blockers.
@@ -1267,6 +1361,10 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
+        # Cross-session PM-owner check (Rule 14): same shape as complete/block.
+        owner_task = kb.get_task(conn, tid)
+        caller_sid = _enforce_pm_owner_mutation(owner_task, "kanban_unblock")
+        _claim_default_queue_if_needed(kb, conn, owner_task, caller_sid)
         _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
@@ -1288,6 +1386,37 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+@_kanban_handler("kanban_handoff_owner")
+def _handle_handoff_owner(args: dict, **kw) -> str:
+    """Transfer pm_owner binding to a new PM session. Idempotent."""
+    _reject_delegated_child_mutation("kanban_handoff_owner")
+    tid = _require_text(args, "task_id")
+    to_sid = _require_text(args, "to_session_id")
+    to_cid = args.get("to_chat_id") or to_sid
+    actor = _persisted_identity()
+    with _board(args.get("board")) as (kb, conn):
+        task = kb.get_task(conn, tid)
+        _check(task is not None, f"task {tid} not found")
+        caller_sid = _resolve_caller_session_id(args)
+        current_owner = (task.pm_owner_session_id if task else None) or PM_OWNER_DEFAULT
+        is_default = current_owner == PM_OWNER_DEFAULT
+        is_owner = bool(caller_sid and caller_sid == current_owner)
+        _check(
+            is_default or is_owner,
+            f"cannot mutate task not owned by this session "
+            f"(task pm_owner_session_id={current_owner!r}, caller session_id={caller_sid!r})",
+        )
+        changed = kb.handoff_owner(
+            conn, task_id=tid, to_session_id=to_sid, to_chat_id=to_cid, actor=actor)
+        return _ok(
+            task_id=tid,
+            pm_owner_session_id=to_sid,
+            pm_owner_chat_id=to_cid,
+            changed=changed,
+            **({"prev_session_id": current_owner} if changed else {}),
+        )
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1307,7 +1436,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_handoff_owner", KANBAN_HANDOFF_OWNER_SCHEMA, _handle_handoff_owner, "🔁"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

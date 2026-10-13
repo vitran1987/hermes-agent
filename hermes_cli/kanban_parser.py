@@ -273,6 +273,13 @@ _SPECS = [
     ], aliases=["diag"], help="List active diagnostics on the current board"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+    _cmd("handoff-owner", [
+        _arg("--task-id", required=True, help="Task id whose PM owner to re-point"),
+        _arg("--to-session-id", required=True,
+             help="Target PM session id (becomes the new pm_owner_session_id)"),
+        _arg("--to-chat-id", help="Target chat id; defaults to session id"),
+        _json_flag(),
+    ], help="Re-point a task's PM owner (CEO-APPROVED 2026-10-13, Rule 14)"),
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),

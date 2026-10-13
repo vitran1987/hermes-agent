@@ -211,6 +211,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
+    "handoff-owner",
     "gc",
 })
 
@@ -722,6 +723,44 @@ def _cmd_link(args: argparse.Namespace) -> int:
             f"completes; use `hermes kanban unlink {args.parent_id} {args.child_id}` "
             f"to run it now."
         )
+    return 0
+
+
+def _cmd_handoff_owner(args: argparse.Namespace) -> int:
+    """Re-point a task's PM owner (Rule 14, CEO-APPROVED 2026-10-13).
+
+    Idempotent: re-pointing to the same session is a no-op (prints ``noop``).
+    Emits a ``task_events`` row of kind ``owner_handoff`` and appends to
+    ``metadata.handoff_chain`` so the transfer is auditable.
+    """
+    task_id = getattr(args, "task_id", None)
+    to_sid = getattr(args, "to_session_id", None)
+    to_cid = getattr(args, "to_chat_id", None)
+    actor = _profile_author()
+    if not task_id or not to_sid:
+        return _err("both --task-id and --to-session-id are required")
+    with kbc.connect_closing() as conn:
+        # CLI callers are never a "live PM session"; they can only re-point
+        # cards that are currently in the default queue. Operator-only path;
+        # PM sessions route through `kanban_handoff_owner` (tool) or
+        # `a2a_call pm-bangioi`.
+        current = kb.get_task(conn, task_id)
+        if current is None:
+            return _err(f"no such task: {task_id}")
+        if current.pm_owner_session_id and current.pm_owner_session_id != kb.PM_OWNER_DEFAULT:
+            return _err(
+                f"refusing to handoff {task_id}: owned by "
+                f"{current.pm_owner_session_id!r} (not the default queue). "
+                f"Have the owning session re-point it via kanban_handoff_owner."
+            )
+        changed = kb.handoff_owner(
+            conn, task_id=task_id, to_session_id=to_sid,
+            to_chat_id=to_cid, actor=actor)
+    if _json_out(args, {"task_id": task_id, "pm_owner_session_id": to_sid,
+                       "pm_owner_chat_id": to_cid, "changed": changed}, ascii=True):
+        return 0
+    state = "changed" if changed else "noop"
+    print(f"{state}: {task_id} -> {to_sid} (chat_id={to_cid or to_sid})")
     return 0
 
 
@@ -1336,6 +1375,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+    "handoff-owner": _cmd_handoff_owner,
     "gc": _cmd_gc,
 }
 
@@ -1356,6 +1396,7 @@ Common subcommands:
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
+  `handoff-owner <task> <new-pm>`  Re-point a task's PM owner (Rule 14)
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump

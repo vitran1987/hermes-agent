@@ -115,6 +115,146 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
+# --- PM ownership (Rule 14, CEO-APPROVED 2026-10-13) ---
+#
+# PM (Product Manager) is the single owner of every card on a board.
+# ``pm_owner_session_id`` is a stable pointer to the PM session that owns
+# notifications + mutation authority for a task; ``pm_owner_chat_id`` is the
+# push-notification target (typically the chat the PM is talking to, or the
+# PM session id when there is no separate channel). The architecture:
+#
+# * On ``kanban_create``, only the 5 profiles in ``KANBAN_CREATE_ALLOWLIST``
+#   may create tasks (every other profile is rejected with a fixed error so
+#   a prompt-injected assistant can never silently grow the backlog).
+# * pm-bangioi / user auto-stamp the owner to the live session.
+# * auto-decomposer inherits the owner's binding from the parent card.
+# * dashboard / kanban-capability-reaper leave the owner NULL on creation
+#   so the server defaults it to PM_OWNER_DEFAULT (the PM queue).
+# * Cross-session mutation (complete/block/unblock) is read-only for anyone
+#   who isn't the current owner OR the default queue; the first PM to act
+#   on a default-queue task claims it (auto-handoff).
+# * Stale-session reaper: a PM session whose heartbeat hasn't been seen for
+#   ``PM_OWNER_STALENESS_SECONDS`` is considered dead, and every task it
+#   owned is reset to PM_OWNER_DEFAULT so a fresh PM can pick them up.
+
+KANBAN_CREATE_ALLOWLIST = frozenset({
+    "pm-bangioi",
+    "dashboard",
+    "auto-decomposer",
+    "kanban-capability-reaper",
+    "user",  # direct CEO action from chat
+})
+
+# Tasks with no explicit PM owner (new dashboard/reaper cards, freshly-reset
+# legacy cards, freshly-reset stale-PM cards) live in this default queue. The
+# first PM session to mutate them implicitly claims ownership via the same
+# handoff_owner path used for explicit transfers.
+PM_OWNER_DEFAULT = "pm-bangioi-default"
+
+# A PM session with no heartbeat in this window is reaped: every task it
+# owned is reset to PM_OWNER_DEFAULT. 90s matches the longest legal PM
+# tool-call roundtrip (a normal PM message roundtrip is <30s; 90s leaves
+# room for a slow LLM call without falsely reaping a live session).
+PM_OWNER_STALENESS_SECONDS = 90
+
+# Rendered allowlist for the rejected-from-create error. The literal order in
+# the message MUST match sorted(KANBAN_CREATE_ALLOWLIST) so a downstream
+# grep/test for the allowlist stays stable even if a new profile is introduced.
+# Just an f-string (NOT wrapped in an outer ``", ".join(...)`` — that would
+# iterate the resulting string char-by-char and produce ``{, a, u, t, o, ...}``).
+_KANBAN_CREATE_ALLOWLIST_RENDERED = (
+    f"{{{', '.join(sorted(KANBAN_CREATE_ALLOWLIST))}}}"
+)
+
+# Exact spec message; every non-allowlisted caller of create_task receives
+# this verbatim, no escape hatches.
+KANBAN_CREATE_REJECTED_MESSAGE = (
+    "kanban_create restricted: agent_profile not in "
+    f"{_KANBAN_CREATE_ALLOWLIST_RENDERED}. "
+    "Request task creation via kanban_comment on PM-owned parent "
+    "or a2a_call pm-bangioi."
+)
+
+
+def _enforce_create_allowlist(created_by: Optional[str]) -> None:
+    """Reject ``kanban_create`` from any profile outside ``KANBAN_CREATE_ALLOWLIST``.
+
+    Called at the top of ``create_task`` (Rule 14, CEO-APPROVED 2026-10-13).
+    The exact spec message must be rendered verbatim so a downstream test
+    matches without depending on test-side string substitution. A
+    prompt-injected worker must never silently grow the backlog, so the only
+    way past this gate is to *be* an allowlisted profile.
+    """
+    if created_by in KANBAN_CREATE_ALLOWLIST:
+        return
+    raise ValueError(KANBAN_CREATE_REJECTED_MESSAGE)
+
+
+def _resolve_create_pm_owner(
+    conn: sqlite3.Connection, *, created_by: Optional[str],
+    parents: tuple[str, ...],
+    pm_owner_session_id: Optional[str],
+    pm_owner_chat_id: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Pick the (session_id, chat_id) pair for a freshly-created task.
+
+    Caller-supplied values win (used by ``kanban_handoff_owner``'s re-create
+    path and by tests). Otherwise the rule per profile:
+
+      * ``pm-bangioi`` / ``user`` -> live session + chat id (env fallback).
+      * ``auto-decomposer`` -> INHERIT from the first parent with a non-NULL
+        ``pm_owner_session_id``; if every parent is unowned, fall back to the
+        default queue (server stamps ``PM_OWNER_DEFAULT`` on NULL).
+      * ``dashboard`` / ``kanban-capability-reaper`` -> NULL (the first PM
+        to act on the card claims it via the auto-handoff path).
+      * anything else -> caught upstream by ``_enforce_create_allowlist``.
+    """
+    if pm_owner_session_id is not None or pm_owner_chat_id is not None:
+        # Caller supplied at least one; the server-side default-fallback below
+        # still applies if the caller passed a bare session id with no chat id,
+        # but the caller is the source of truth for the non-NULL one.
+        if pm_owner_session_id is None:
+            pm_owner_session_id = PM_OWNER_DEFAULT
+        return pm_owner_session_id, pm_owner_chat_id
+
+    profile = (created_by or "").strip()
+    if profile in ("pm-bangioi", "user"):
+        live_session = _resolve_live_pm_session_id()
+        live_chat = _resolve_live_pm_chat_id()
+        return live_session, live_chat
+
+    if profile == "auto-decomposer":
+        for parent_id in parents:
+            parent = get_task(conn, parent_id)
+            if parent is not None and parent.pm_owner_session_id:
+                return parent.pm_owner_session_id, parent.pm_owner_chat_id
+        return None, None  # server default-fallback stamps PM_OWNER_DEFAULT
+
+    # dashboard / kanban-capability-reaper / (rarely) a future profile:
+    # leave NULL on insert; the default-fallback below normalises it.
+    return None, None
+
+
+def _resolve_live_pm_session_id() -> Optional[str]:
+    """Best-effort live PM session id from env (chat gateway / agent loop)."""
+    try:
+        return os.environ.get("HERMES_SESSION_ID") or None
+    except Exception:
+        return None
+
+
+def _resolve_live_pm_chat_id() -> Optional[str]:
+    """Best-effort live PM chat id; defaults to the session id when no
+    separate chat channel exists (CLI / cron / TUI)."""
+    try:
+        chat_id = os.environ.get("HERMES_SESSION_CHAT_ID") or None
+        if chat_id:
+            return chat_id
+    except Exception:
+        pass
+    return _resolve_live_pm_session_id()
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
     empty/None = inherit the profile's own effort (NULL). Anything else raises —
@@ -661,6 +801,15 @@ class Task:
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
+    # PM ownership binding (Rule 14, CEO-APPROVED 2026-10-13). NULL = legacy card.
+    # On new tasks, pm_owner_session_id defaults to PM_OWNER_DEFAULT; pm_owner_chat_id
+    # may stay NULL until the first PM session claims it.
+    pm_owner_session_id: Optional[str] = None
+    pm_owner_chat_id: Optional[str] = None
+    # Free-form per-task JSON (handoff history lives here as ``handoff_chain``).
+    # ``None`` until ``handoff_owner`` first writes to it; the dashboard reads
+    # ``task.metadata`` directly so this round-trips intact on read.
+    metadata: Optional[dict] = None
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
@@ -674,7 +823,12 @@ class Task:
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: _to_epoch(g(col)) for col in _TASK_EPOCH_COLUMNS},  # outside writers may store text: epoch or None
-            **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
+            # NOTE: ``metadata`` is intentionally NOT in _TASK_OPTIONAL_COLUMNS
+            # (it's handled by the explicit kwarg below). The remaining optional
+            # columns (including ``pm_owner_session_id`` / ``pm_owner_chat_id``)
+            # are read via the dict-unpack; on legacy boards without those
+            # columns the field stays None via the dataclass default.
+            **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS if col != "metadata"},
             **{col: g(col) or None for col in _TASK_EMPTY_IS_NULL_COLUMNS},
             # Pre-migration fallbacks (spawn_failures / last_spawn_error) are only
             # reachable on a DB never opened since the rename migration landed.
@@ -683,6 +837,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            metadata=_json_dict(g("metadata")),
         )
 
 
@@ -697,6 +852,13 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    # PM ownership binding (Rule 14, CEO-APPROVED 2026-10-13); NULL on legacy cards
+    # and on dashboard/reaper-created cards that haven't been bound to a PM session yet.
+    "pm_owner_session_id", "pm_owner_chat_id",
+    # Free-form per-task JSON (handoff history, dashboard tags). Decoded by
+    # ``from_row`` into ``task.metadata``; legacy boards without the column get
+    # ``None`` and the dataclass default carries the field forward.
+    "metadata",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -889,6 +1051,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- profile's state.db (kanban_create verifies before stamping). Indexed
     -- so per-session list queries stay cheap on larger boards.
     session_id           TEXT,
+    -- PM ownership binding (Rule 14, CEO-APPROVED 2026-10-13). NULL = legacy card.
+    pm_owner_session_id   TEXT,
+    pm_owner_chat_id      TEXT,
+    -- Free-form per-task JSON (handed-off PM history, dashboard tags, ...).
+    -- ``handoff_owner`` deep-merges into ``metadata.handoff_chain`` and the
+    -- surrounding keys are preserved; a corrupt cell decodes to ``{}`` and
+    -- never aborts a write. NULL on legacy rows.
+    metadata             TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -999,6 +1169,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_pm_owner_session ON tasks(pm_owner_session_id);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
@@ -1195,6 +1366,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    pm_owner_session_id: Optional[str] = None,
+    pm_owner_chat_id: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1210,10 +1383,21 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+
+    PM ownership (``Rule 14``): ``created_by`` must be in ``KANBAN_CREATE_ALLOWLIST``
+    or the call is rejected with ``KANBAN_CREATE_REJECTED_MESSAGE``. When the
+    caller doesn't supply an explicit ``pm_owner_session_id``/``pm_owner_chat_id``,
+    create_task resolves them per the caller:
+      * ``pm-bangioi`` / ``user`` -> live session + chat id (env fallback);
+      * ``auto-decomposer`` -> inherited from a parent that already has a non-NULL
+        owner, else defaults to the PM queue;
+      * ``dashboard`` / ``kanban-capability-reaper`` -> NULL (server falls back
+        to ``PM_OWNER_DEFAULT`` so the next PM to act claims the card).
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    _enforce_create_allowlist(created_by)
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1262,6 +1446,18 @@ def create_task(
 
     now = int(time.time())
 
+    # PM-owner resolution (Rule 14, CEO-APPROVED 2026-10-13): the caller is the
+    # source of truth when they pass a value; otherwise profile rules apply
+    # (pm-bangioi/user -> live session, auto-decomposer -> inherit, dashboard/
+    # reaper -> NULL = PM queue). The default-fallback (NULL -> PM_OWNER_DEFAULT)
+    # is applied here so the row that lands on disk is never NULL.
+    pm_owner_session_id, pm_owner_chat_id = _resolve_create_pm_owner(
+        conn, created_by=created_by, parents=parents,
+        pm_owner_session_id=pm_owner_session_id, pm_owner_chat_id=pm_owner_chat_id,
+    )
+    if pm_owner_session_id is None:
+        pm_owner_session_id = PM_OWNER_DEFAULT
+
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
@@ -1294,8 +1490,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        pm_owner_session_id, pm_owner_chat_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1305,6 +1502,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        pm_owner_session_id, pm_owner_chat_id,
                     ),
                 )
                 for pid in parents:
@@ -1327,6 +1525,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "pm_owner_session_id": pm_owner_session_id,
+                        "pm_owner_chat_id": pm_owner_chat_id,
                     },
                 )
                 if task_status == "blocked":
@@ -1648,6 +1848,204 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # leaving it in todo until the next tick.
         recompute_ready(conn)
     return removed
+
+
+def handoff_owner(
+    conn: sqlite3.Connection, *, task_id: str,
+    to_session_id: str, to_chat_id: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> bool:
+    """Re-point a task's ``pm_owner_session_id`` / ``pm_owner_chat_id``.
+
+    Idempotent: if the task is already owned by ``to_session_id`` with the same
+    ``to_chat_id``, this is a no-op (returns ``False``). Otherwise the task's
+    ``tasks.pm_owner_*`` columns are updated, an entry is appended to
+    ``tasks.metadata.handoff_chain`` (deep-merged with any existing keys), and
+    a ``task_events`` row with ``kind="owner_handoff"`` records the transfer.
+
+    Returns ``True`` when a change was committed, ``False`` on no-op.
+
+    Authorization is NOT enforced here: callers (``tools.kanban_tools`` handler
+    and ``hermes_cli.kanban`` CLI) must check the caller's session against the
+    current owner / default queue before invoking this. The default queue
+    auto-claim path (``kanban_complete`` etc.) also funnels through here.
+    """
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not to_session_id:
+        raise ValueError("to_session_id is required")
+
+    actor = (actor or "").strip() or None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT pm_owner_session_id, pm_owner_chat_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"task {task_id} not found")
+
+        old_session = row["pm_owner_session_id"] if "pm_owner_session_id" in row.keys() else None
+        old_chat = row["pm_owner_chat_id"] if "pm_owner_chat_id" in row.keys() else None
+        if old_session == to_session_id and (old_chat or None) == (to_chat_id or None):
+            # No-op: caller already owns this. Don't pollute the event log
+            # with redundant transfers; just signal no change to the caller.
+            return False
+
+        # Deep-merge: load existing metadata ({} on legacy / never-touched rows),
+        # append to handoff_chain, preserve every other key the dashboard/CRUD
+        # path may have written (priority_reason, custom_tags, ...). Round-trip
+        # via JSON so a corrupt cell degrades to ``{}`` instead of aborting.
+        existing_meta = conn.execute(
+            "SELECT metadata FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        meta_text = existing_meta["metadata"] if existing_meta and "metadata" in existing_meta.keys() else None
+        meta_obj: dict = {}
+        if meta_text:
+            try:
+                parsed = json.loads(meta_text)
+                if isinstance(parsed, dict):
+                    meta_obj = parsed
+            except (ValueError, TypeError):
+                meta_obj = {}
+
+        chain = meta_obj.get("handoff_chain")
+        if not isinstance(chain, list):
+            chain = []
+        chain.append({
+            "from": old_session,
+            "to": to_session_id,
+            "to_chat_id": to_chat_id,
+            "at": int(time.time()),
+            "actor": actor,
+        })
+        meta_obj["handoff_chain"] = chain
+
+        # Update pm_owner fields + write back metadata in one statement. SQLite
+        # doesn't need ``metadata`` in the column list of an UPDATE for legacy
+        # boards; the migration path adds it. Use a CASE so a board that has
+        # not yet received the metadata column upgrade still succeeds — that's
+        # the same safety net complete_task / block_task apply for newer columns.
+        try:
+            conn.execute(
+                "UPDATE tasks SET pm_owner_session_id = ?, pm_owner_chat_id = ?, "
+                "metadata = ? WHERE id = ?",
+                (to_session_id, to_chat_id, json.dumps(meta_obj), task_id),
+            )
+        except sqlite3.OperationalError:
+            # Legacy board: no ``metadata`` column. Stamp only the owner fields.
+            conn.execute(
+                "UPDATE tasks SET pm_owner_session_id = ?, pm_owner_chat_id = ? WHERE id = ?",
+                (to_session_id, to_chat_id, task_id),
+            )
+
+        # Audit log: one event per real handoff (skipped on no-op above).
+        _append_event(
+            conn,
+            task_id,
+            "owner_handoff",
+            {
+                "from_session_id": old_session,
+                "from_chat_id": old_chat,
+                "to_session_id": to_session_id,
+                "to_chat_id": to_chat_id,
+                "actor": actor,
+                "at": int(time.time()),
+            },
+        )
+    return True
+
+
+def reap_stale_pm_sessions(
+    conn: sqlite3.Connection,
+    *,
+    staleness_seconds: int = PM_OWNER_STALENESS_SECONDS,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Reset ``pm_owner_session_id`` to ``PM_OWNER_DEFAULT`` on tasks whose
+    owning PM session has not heartbeated within ``staleness_seconds``.
+
+    A "PM session" is alive iff at least one ``task_runs.last_heartbeat_at``
+    row newer than ``now - staleness_seconds`` references its id, OR a
+    ``task_events`` row of any kind was added within the same window for one
+    of its tasks (event-only PM sessions, no worker). Anything not alive is
+    reaped: each task it owns has ``pm_owner_session_id`` flipped to
+    ``PM_OWNER_DEFAULT`` and a ``task_events`` row of kind ``pm_owner_reset``
+    records the change with the previous session id and reason.
+
+    Returns the touched task ids (deduplicated, order not guaranteed).
+    Intended to run from the dispatcher's reclaim phase (``_run_reclaim_phase``)
+    so the reset lands before any PM-side mutation check fires.
+    """
+    now = int(time.time()) if now is None else int(now)
+    if staleness_seconds <= 0:
+        return []
+
+    # Distinct non-default, non-NULL owner ids. The dispatcher hasn't spawned
+    # a worker for these sessions yet (else the run's heartbeat would catch it),
+    # so the only liveness signal is an event on one of their tasks.
+    owner_rows = conn.execute(
+        "SELECT DISTINCT pm_owner_session_id FROM tasks "
+        "WHERE pm_owner_session_id IS NOT NULL "
+        "  AND pm_owner_session_id != ?",
+        (PM_OWNER_DEFAULT,),
+    ).fetchall()
+    owners = [r["pm_owner_session_id"] for r in owner_rows]
+    if not owners:
+        return []
+
+    cutoff = now - staleness_seconds
+    placeholders = ",".join("?" * len(owners))
+    # Liveness = a task_event newer than cutoff on any task this owner
+    # currently owns. That's the canonical signal: every PM action
+    # (create / handoff / comment / complete / block) lands a task_event row.
+    # A session with no events for ``staleness_seconds`` has gone silent and
+    # its tasks should reset to the default queue so the next PM can claim
+    # them. The earlier ``task_runs.session_id`` reference was based on a
+    # column that does NOT exist on ``task_runs`` (session id is on
+    # ``tasks``, not on runs); that branch is removed here, not duplicated.
+    live_event_rows = conn.execute(
+        f"SELECT DISTINCT t.pm_owner_session_id AS sid FROM tasks t "
+        f"JOIN task_events e ON e.task_id = t.id "
+        f"WHERE t.pm_owner_session_id IN ({placeholders}) "
+        f"  AND e.created_at >= ?",
+        (*owners, cutoff),
+    ).fetchall()
+    live_from_events = {r["sid"] for r in live_event_rows if r["sid"]}
+
+    dead_owners = [s for s in owners if s not in live_from_events]
+    if not dead_owners:
+        return []
+
+    touched: list[str] = []
+    with write_txn(conn):
+        for owner in dead_owners:
+            task_rows = conn.execute(
+                "SELECT id, pm_owner_chat_id FROM tasks "
+                "WHERE pm_owner_session_id = ?",
+                (owner,),
+            ).fetchall()
+            for tr in task_rows:
+                tid = tr["id"]
+                old_chat = tr["pm_owner_chat_id"] if "pm_owner_chat_id" in tr.keys() else None
+                conn.execute(
+                    "UPDATE tasks SET pm_owner_session_id = ?, pm_owner_chat_id = NULL "
+                    "WHERE id = ?",
+                    (PM_OWNER_DEFAULT, tid),
+                )
+                _append_event(
+                    conn,
+                    tid,
+                    "pm_owner_reset",
+                    {
+                        "prev_session_id": owner,
+                        "prev_chat_id": old_chat,
+                        "reason": "heartbeat_stale",
+                        "staleness_seconds": staleness_seconds,
+                        "at": int(time.time()),
+                    },
+                )
+                touched.append(tid)
+    return touched
 
 
 def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -> list[str]:

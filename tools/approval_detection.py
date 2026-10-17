@@ -18,6 +18,16 @@ logger = logging.getLogger("tools.approval")
 # home is folded into these forms at detection time by _normalize_command_for_detection(), so no
 # import-time path snapshot (stale once HERMES_HOME is set after import) lives in the patterns.
 _SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+# READ side of the same path. Every spelling of the resolved user home — native backslash,
+# forward-slash, MSYS `/c/`, `~`, `$HOME`/`%USERPROFILE%` — is folded to `~/...` by
+# _normalize_command_for_detection() BEFORE the pattern pass, so ONE rule keyed on the folded
+# form gates them all at once, and no dialect can be left behind. The `users/<name>/.ssh` rule
+# in the Windows tier is the only other read gate there is: it keys on the literal substring the
+# fold deletes, so as soon as a spelling folds it stops matching and the key reads ungated
+# (`_SSH_SENSITIVE_PATH` itself was write-only: tee / redirection / cp-mv-install / sed -i).
+# Boundary, not `(?:/|$)` as in the write fragment: `ls ~/.ssh -la` must gate as well as
+# `ls ~/.ssh/id_rsa` and a bare `ls ~/.ssh`.
+_SSH_HOME_ACCESS_PATH = r'(?:~|\$home|\$\{home\})/\.ssh' + r'(?=/|[\s;&|<>"\')]|$)'
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'\.env\b'
 )
@@ -280,7 +290,10 @@ DANGEROUS_PATTERNS = [
     # Windows service/system stop — analogue of systemctl stop.
     (r'\bstop-service\b[^\n]*\s-force\b', "force stop service (Stop-Service -Force)"),
     (r'\bsc(?:\.exe)?\s+(?:stop|delete)\b', "stop/delete service (sc)"),
-    # Windows-form credential paths; the POSIX ~/.ssh patterns never match drive-letter or backslash spellings.
+    # Windows-form credential paths; the POSIX ~/.ssh patterns never match drive-letter or backslash
+    # spellings ON THEIR OWN. Conversely this rule never sees a home-spelling path at all: the fold
+    # rewrites `C:\Users\<u>\.ssh\...`, `/c/Users/<u>/.ssh/...`, `~/.ssh/...` and `$HOME/.ssh/...`
+    # to the same `~/...` before this pass — that side is the home-path read rule at the end of this list.
     (r'\busers[\\/][^\\/\s]+[\\/]\.ssh\b', "access to SSH keys (Windows path)"),
     (r'\bappdata[\\/](?:local|roaming)[\\/]hermes[^\n]*\.env\b', "access to Hermes secrets (Windows path)"),
     # ── end of Windows tier
@@ -409,7 +422,9 @@ DANGEROUS_PATTERNS = [
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
     # cp/mv/install OVERWRITING a credential/SSH/shell-rc/Hermes file (key implant, login-time
     # injection) — pairs the tee/redirection coverage. Anchored to the command tail so only the
-    # DESTINATION fires; reading OUT of a sensitive path (`cp ~/.ssh/config /tmp/x`) stays safe.
+    # DESTINATION fires; reading OUT of a sensitive path is not this rule's business — `cp a.txt
+    # b.txt` and `cp ~/.bashrc /tmp/x` stay out of it. (Reading OUT of `.ssh` — the exfil shape
+    # `cp ~/.ssh/id_rsa /tmp/loot` — is gated by the home-path read rule at the end of this list.)
     # The trailing `[^\s"\']*` consumes the rest of the destination filename.
     # The tee/redirection patterns above already gate _SENSITIVE_WRITE_TARGET (~/.ssh/*,
     # ~/.netrc/.pgpass/.npmrc/.pypirc, shell rc files, ~/.hermes/config.yaml/.env), but cp/mv/install was
@@ -479,6 +494,15 @@ DANGEROUS_PATTERNS = [
     (_CMDPOS + r'yarn\s+' + _PKG_OPTS + r'(?:global\s+)?(?:uninstall|remove)\b', "package manager uninstall"),
     (_CMDPOS + r'pip(?:3)?\s+' + _PKG_OPTS + r'uninstall\b', "package manager uninstall"),
     (_CMDPOS + r'brew\s+' + _PKG_OPTS + r'(?:uninstall|remove|rm)\b', "package manager uninstall"),
+    # .ssh READS in the folded home spelling — the last rule in this list on purpose.
+    # Verdict-agnostic on the verb, exactly like the `users/<name>/.ssh` rule above it: a verb
+    # list would only re-open the verb x spelling matrix (cat, base64, grep, cp-out exfil, mv,
+    # chmod, rm -f, shred -u, ssh-keygen, ...) that this rule exists to close, and every one of
+    # those verbs is gated today on the spellings the fold does not reach.
+    # LAST so every existing rule keeps its own reason key: the tee / redirection / cp-mv-install /
+    # sed -i writes above still report the write reason, and no stored approval key moves — only
+    # commands that matched NOTHING today (the ungated reads) reach this rule.
+    (_SSH_HOME_ACCESS_PATH, "access to SSH keys (home path)"),
 ]
 
 

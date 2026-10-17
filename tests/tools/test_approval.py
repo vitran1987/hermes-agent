@@ -623,8 +623,10 @@ class TestSensitiveCopyMovePattern:
             assert dangerous is True, command
             assert key is not None, command
 
-    def test_reads_and_unrelated_copies_safe(self):
-        for cmd in ("cp ~/.ssh/config /tmp/x", "cp a.txt b.txt"):
+    def test_unrelated_copies_stay_safe(self):
+        # Reading OUT of .ssh is no longer the cp rule's business either: it is gated by the
+        # home-path read rule (see tests/tools/test_approval_ssh_key_reads.py).
+        for cmd in ("cp a.txt b.txt", "cp notes.txt backup/notes.txt", "cp ~/.bashrc /tmp/x"):
             dangerous, _key, _desc = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 

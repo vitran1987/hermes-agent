@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+from enum import StrEnum
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
@@ -328,9 +329,15 @@ def venv_bin_dir(venv: Path, *, windows: bool | None = None) -> Path:
 
 
 def venv_python(venv: Path, *, windows: bool | None = None) -> Path:
-    """The interpreter inside *venv* (may not exist)."""
+    """The Python interpreter inside *venv* (may not exist yet)."""
     bin_dir = venv_bin_dir(venv, windows=windows)
     return bin_dir / ("python.exe" if bin_dir.name == "Scripts" else "python")
+
+
+def venv_hermes(venv: Path, *, windows: bool | None = None) -> Path:
+    """The Hermes console-script executable inside *venv* (may not exist)."""
+    bin_dir = venv_bin_dir(venv, windows=windows)
+    return bin_dir / ("hermes.exe" if bin_dir.name == "Scripts" else "hermes")
 
 
 def project_python(project_root: Path) -> Path:
@@ -378,6 +385,13 @@ def venv_python_version(venv: Path) -> tuple[int, int] | None:
     built the environment with CPython 3.14 while the PATH shim ran 3.11, so the
     shim composed ``lib/python3.11/site-packages`` inside a 3.14 venv, found no
     tree, and failed *after* a successful update.
+
+    Reads ``version_info`` (the canonical CPython ``pyvenv.cfg`` key — see
+    ``venv/__init__.py::create``); the bare ``version`` key was a stale alias
+    only a handful of older uv / virtualenv builds ever emitted, so it is no
+    longer the first thing this function checks. ``version_info`` is what every
+    real ``pyvenv.cfg`` ships, so callers can use the return value as the ABI
+    pair-check against an interpreter without re-implementing the parse.
     """
     try:
         for line in (venv / "pyvenv.cfg").read_text(encoding="utf-8-sig").splitlines():
@@ -400,6 +414,61 @@ def venv_python_version(venv: Path) -> tuple[int, int] | None:
         if major.isdigit() and minor.isdigit():
             return int(major), int(minor)
     return None
+
+
+def interpreter_python_version(interpreter: Path) -> tuple[int, int] | None:
+    """The Python version (major, minor) of an interpreter read from the venv it sits in.
+
+    Walks up from ``interpreter`` looking for a ``pyvenv.cfg`` — first the interpreter's
+    parent directory (a venv accessed through ``bin/python``), then one further (a venv
+    accessed through ``Scripts/python.exe``). Returns ``None`` when no venv is in scope:
+    a base interpreter (e.g. ``cpython-3.11-windows-x86_64-none/python.exe``) has no
+    ``pyvenv.cfg``, and any caller that treats unknown as a conservative "no match"
+    must refuse the pairing instead of crashing at import time.
+    """
+    for candidate in (interpreter.parent, interpreter.parent.parent):
+        cfg_path = candidate / "pyvenv.cfg"
+        if cfg_path.is_file():
+            version = venv_python_version(candidate)
+            if version is not None:
+                return version
+    return None
+
+
+class AbiCompatibility(StrEnum):
+    """The ABI verdict between an env's compiled extensions and an interpreter.
+
+    ``compatible``: both versions known and equal. ``incompatible``: both known and
+    different. ``unknown``: either side's version is unreadable (no ``pyvenv.cfg``
+    at either walk-up level, missing tree) — a refusal to decide, not a mismatch.
+    """
+
+    compatible = "compatible"
+    incompatible = "incompatible"
+    unknown = "unknown"
+
+
+def env_supports_interpreter(env_venv: Path, interpreter: Path) -> AbiCompatibility:
+    """The ABI verdict between ``env_venv``'s compiled extensions and ``interpreter``'s Python.
+
+    A 3.11 interpreter pointed at a 3.14 env's site-packages fails every compiled import
+    (e.g. ``ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'``) because
+    CPython loads extensions by ABI tag (``cpXY``). Callers use the verdict to substitute a
+    verified-safe interpreter (the env's own interpreter, built alongside the env's
+    site-packages) — and only on ``incompatible``: ``unknown`` (either side unreadable,
+    e.g. a bare store python with no ``pyvenv.cfg``) and ``compatible`` leave the
+    caller's argv alone, because rewriting a working interpreter into an untested one
+    is the costlier mistake when the pair was never verified.
+    """
+    env_version = venv_python_version(env_venv)
+    interpreter_version = interpreter_python_version(interpreter)
+    if env_version is None or interpreter_version is None:
+        return AbiCompatibility.unknown
+    return (
+        AbiCompatibility.compatible
+        if env_version == interpreter_version
+        else AbiCompatibility.incompatible
+    )
 
 
 def site_packages(venv: Path) -> Path:

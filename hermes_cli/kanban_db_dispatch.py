@@ -2465,18 +2465,6 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     return parsed if parsed >= minimum else default
 
 
-def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
-
-
-def _absolute_hermes_path(path: str) -> str:
-    """Return an absolute filesystem path for a resolved Hermes shim."""
-    expanded = os.path.expanduser(path)
-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
-
-
 def _looks_like_path(value: str) -> bool:
     """Return true when a command override is an explicit path, not a name."""
     expanded = os.path.expanduser(value)
@@ -2487,11 +2475,6 @@ def _looks_like_path(value: str) -> bool:
         or "\\" in expanded
         or bool(re.match(r"^[A-Za-z]:", expanded))
     )
-
-
-def _is_windows_batch_shim(path: str) -> bool:
-    """Return true for Windows shell/batch shims that should not be argv[0]."""
-    return path.lower().endswith((".cmd", ".bat"))
 
 
 def _path_search_names(command: str) -> list[str]:
@@ -2520,15 +2503,6 @@ def _safe_which_no_cwd(command: str) -> Optional[str]:
     return None
 
 
-def _hermes_path_argv(path: str) -> list[str]:
-    """argv for a resolved Hermes executable path. Windows batch shims
-    (``.cmd``/``.bat``) are unsafe as argv[0] because the argument vector
-    includes task-derived values; prefer the module form."""
-    if _kb._IS_WINDOWS and _is_windows_batch_shim(path):
-        return _module_hermes_argv()
-    return [_absolute_hermes_path(path)]
-
-
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
@@ -2543,6 +2517,8 @@ def _resolve_hermes_argv() -> list[str]:
     """
     import importlib.util
     import shutil
+
+    from hermes_cli._worker_argv_prep import _hermes_path_argv, _module_hermes_argv
 
     env_bin = os.environ.get("HERMES_BIN", "").strip()
     if env_bin:
@@ -2868,6 +2844,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # external worker (#112729): applied to the sanitized env, after every other decision stands.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    # When the argv's interpreter is from a different Python than the committed
+    # env's site-packages, the worker dies on its first compiled import. Swap
+    # cmd[0] for the env's own executable (env python for a module argv, the
+    # env's hermes executable for a CLI argv) before restart-safe wrapping —
+    # the wrap may re-exec argv[0] verbatim.
+    from hermes_cli._worker_argv_prep import _swap_worker_argv_for_env_abi
+
+    _swap_worker_argv_for_env_abi(cmd, Path(__file__).resolve().parents[1])
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

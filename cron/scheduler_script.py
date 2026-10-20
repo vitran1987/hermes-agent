@@ -180,7 +180,10 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             interpreter = sibling
 
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import committed_venv, site_packages as dependency_site
+    from pm.environments import (
+        AbiCompatibility, committed_venv, env_supports_interpreter,
+        site_packages as dependency_site, venv_python,
+    )
 
     repo = Path(__file__).resolve().parents[1]
     managed_python = resolve_store_python(repo)
@@ -191,8 +194,24 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         # and site-packages (a bare store Python would die on its first import).
         environment = committed_venv(repo)
         if environment is not None:
-            return str(managed_python), {"PYTHONPATH": os.pathsep.join(
-                [str(repo), str(dependency_site(environment))])}
+            # Only a verified-compatible ABI may ride the store Python: an
+            # ``unknown`` verdict (bare store python, no pyvenv.cfg) or an
+            # incompatible one must fall to the env's own interpreter below —
+            # StrEnum values are truthy, so the comparison must be explicit.
+            if env_supports_interpreter(environment, managed_python) is AbiCompatibility.compatible:
+                return str(managed_python), {"PYTHONPATH": os.pathsep.join(
+                    [str(repo), str(dependency_site(environment))])}
+            # ABI mismatch (or a verdict we cannot verify): the store Python may
+            # not import the compiled extensions shipped for a different
+            # interpreter version. Substitute the env's own interpreter, which
+            # PM built alongside the env's site-packages and is therefore always
+            # ABI-consistent. Falls through to the in-tree venv branch below if
+            # the env tree is somehow missing (the cron caller still gets a
+            # working interpreter).
+            env_python = venv_python(environment)
+            if env_python.is_file():
+                return str(env_python), {"PYTHONPATH": os.pathsep.join(
+                    [str(repo), str(dependency_site(environment))])}
 
     cfg = _read_windows_pyvenv_cfg(venv_dir)
     home = cfg.get("home", "")

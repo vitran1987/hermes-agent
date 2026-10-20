@@ -378,11 +378,18 @@ def venv_python_version(venv: Path) -> tuple[int, int] | None:
     built the environment with CPython 3.14 while the PATH shim ran 3.11, so the
     shim composed ``lib/python3.11/site-packages`` inside a 3.14 venv, found no
     tree, and failed *after* a successful update.
+
+    Reads ``version_info`` (the canonical CPython ``pyvenv.cfg`` key — see
+    ``venv/__init__.py::create``); the bare ``version`` key was a stale alias
+    only a handful of older uv / virtualenv builds ever emitted, so it is no
+    longer the first thing this function checks. ``version_info`` is what every
+    real ``pyvenv.cfg`` ships, so callers can use the return value as the ABI
+    pair-check against an interpreter without re-implementing the parse.
     """
     try:
         for line in (venv / "pyvenv.cfg").read_text(encoding="utf-8-sig").splitlines():
             key, _, value = line.partition("=")
-            if key.strip() != "version":
+            if key.strip() not in ("version_info", "version"):
                 continue
             major, _, rest = value.strip().partition(".")
             minor, _, _ = rest.partition(".")
@@ -400,6 +407,46 @@ def venv_python_version(venv: Path) -> tuple[int, int] | None:
         if major.isdigit() and minor.isdigit():
             return int(major), int(minor)
     return None
+
+
+def interpreter_python_version(interpreter: Path) -> tuple[int, int] | None:
+    """The Python version (major, minor) of an interpreter read from the venv it sits in.
+
+    Walks up from ``interpreter`` looking for a ``pyvenv.cfg`` — first the interpreter's
+    parent directory (a venv accessed through ``bin/python``), then one further (a venv
+    accessed through ``Scripts/python.exe``). Returns ``None`` when no venv is in scope:
+    a base interpreter (e.g. ``cpython-3.11-windows-x86_64-none/python.exe``) has no
+    ``pyvenv.cfg``, and any caller that treats unknown as a conservative "no match"
+    must refuse the pairing instead of crashing at import time.
+    """
+    for candidate in (interpreter.parent, interpreter.parent.parent):
+        cfg_path = candidate / "pyvenv.cfg"
+        if cfg_path.is_file():
+            version = venv_python_version(candidate)
+            if version is not None:
+                return version
+    return None
+
+
+def env_supports_interpreter(env_venv: Path, interpreter: Path) -> bool:
+    """True iff ``env_venv``'s site-packages ship compiled extensions for ``interpreter``'s Python.
+
+    A 3.11 interpreter pointed at a 3.14 env's site-packages fails every compiled import
+    (e.g. ``ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'``) because
+    CPython loads extensions by ABI tag (``cpXY``). Pairing interpreter and site-packages
+    built for different Python versions is the failure mode documented on
+    ``_windows_cron_python_invocation`` and ``_propagate_module_import_root``; this check
+    refuses the pairing so the caller can substitute a verified-safe interpreter
+    (the env's own interpreter, built alongside the env's site-packages).
+
+    Unknown on either side returns ``False`` — when we cannot verify the ABI match, do not
+    assume it; fall back to a self-consistent pair instead of letting the import fail later.
+    """
+    env_version = venv_python_version(env_venv)
+    interpreter_version = interpreter_python_version(interpreter)
+    if env_version is None or interpreter_version is None:
+        return False
+    return env_version == interpreter_version
 
 
 def site_packages(venv: Path) -> Path:

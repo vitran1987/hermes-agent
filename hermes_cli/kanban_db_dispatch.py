@@ -2512,6 +2512,36 @@ def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
     pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
 
+def _swap_worker_argv_for_env_abi(cmd: list[str], repo_root: Path) -> None:
+    """Replace ``cmd[0]`` when the chosen interpreter cannot load the env's compiled extensions.
+
+    A kanban worker inherits its PYTHONPATH from this dispatcher (path-form workers get
+    it via the dispatcher's own env; module-form workers get it via ``pin_hermes_tree_on_pythonpath``).
+    When the chosen interpreter's Python version differs from the committed env's
+    (``cp311`` store python reading ``cp314``-only ``pydantic_core``), every compiled import
+    dies with ``ModuleNotFoundError``. Substitute the env's own interpreter — it was built
+    alongside the env's site-packages, so the ABI is guaranteed to match.
+
+    The swap covers both argv forms: module form (``sys.executable -m hermes_cli.main``,
+    where ``sys.executable`` is the dispatcher's 3.11 store python) and path form
+    (``Scripts/hermes.exe``, whose bundled python.exe shares the venv's pyvenv.cfg).
+    Falls back silently to the original cmd when the env or its interpreter is missing —
+    the caller still gets a working argv and the missing-tree error surfaces at file-system
+    level instead of being swallowed as an ABI mismatch.
+    """
+    from pm.environments import committed_venv, env_supports_interpreter, venv_python
+
+    environment = committed_venv(repo_root)
+    if environment is None:
+        return
+    interpreter = Path(cmd[0])
+    if not interpreter.is_file() or env_supports_interpreter(environment, interpreter):
+        return
+    env_python = venv_python(environment)
+    if env_python.is_file():
+        cmd[0] = str(env_python)
+
+
 def _absolute_hermes_path(path: str) -> str:
     """Return an absolute filesystem path for a resolved Hermes shim."""
     expanded = os.path.expanduser(path)
@@ -2938,6 +2968,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
+    # When the chosen argv interpreter (store python or path-form hermes.exe) is from
+    # a different Python than the committed env's site-packages, the worker will
+    # fail every compiled import. Swap cmd[0] for the env's own interpreter before
+    # restart-safe wrapping — the wrap may re-exec argv[0] verbatim.
+    _swap_worker_argv_for_env_abi(cmd, Path(__file__).resolve().parents[1])
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

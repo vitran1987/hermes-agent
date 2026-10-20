@@ -16,6 +16,11 @@ When the store Python's ABI does NOT match the committed env's compiled extensio
 ``cpXY`` is in the env's site-packages than the store Python would resolve), the store Python
 would die on first import. Substitute the env's own interpreter — it was built alongside the
 env's site-packages, so the ABI is guaranteed to match. See #1817 / PM root-cause 2026-10-20.
+
+The kanban-side sibling is covered here too: ``hermes_cli._worker_argv_prep.
+_swap_worker_argv_for_env_abi`` makes the same substitution for worker argvs — the env's
+python for a module argv, the env's own ``hermes`` executable for a CLI argv — and only on a
+verified ``incompatible`` verdict (the tri-state ``pm.environments.env_supports_interpreter``).
 """
 
 import os
@@ -136,29 +141,147 @@ def test_managed_install_falls_back_to_env_python_on_abi_mismatch(
     assert overlay == committed / "Lib" / "site-packages"
 
 
-def test_env_supports_interpreter_refuses_unknown_versions(
-    tmp_path,
-):
-    """When the interpreter has no version metadata, ``env_supports_interpreter`` returns False.
+def test_swap_worker_argv_path_form_swaps_to_env_hermes_exe(tmp_path, monkeypatch):
+    """A CLI argv keeps its Hermes executable — a mismatched pair swaps to the env's hermes.
 
-    A base interpreter (no venv, no pyvenv.cfg) cannot be verified — refuse the pairing
-    rather than assume it matches. Callers then fall back to a self-consistent interpreter.
+    Path-form argv is ``[<hermes.exe>, "-p", <profile>, ...]``; rewriting cmd[0] to a bare
+    CPython hands the whole Hermes CLI tail to the interpreter, which dies with
+    ``Unknown option: -p``. Only a verified ABI mismatch (3.11 interpreter venv vs 3.14
+    env) fires the swap, and it must land on the env's own ``Scripts/hermes.exe`` — never
+    the env's python.
     """
-    from pm.environments import env_supports_interpreter
+    from hermes_cli._worker_argv_prep import _swap_worker_argv_for_env_abi
 
     committed = _write_venv(tmp_path / "installs" / "gen" / "venv", python_version="3.14")
-    # A file with no pyvenv.cfg at any walk-up candidate.
-    base_interpreter = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none" / "python.exe"
-    base_interpreter.parent.mkdir(parents=True)
-    base_interpreter.write_text("", encoding="utf-8")
-    assert not env_supports_interpreter(committed, base_interpreter)
+    (committed / "Scripts" / "hermes.exe").write_text("", encoding="utf-8")
+    # The dispatcher's hermes.exe sits in a 3.11 venv: argv[0]'s walk-up finds
+    # pyvenv.cfg=3.11 against the env's 3.14 → incompatible, so the swap fires.
+    interpreter_venv = _write_venv(tmp_path / "interp", python_version="3.11")
+    dispatch_hermes = interpreter_venv / "Scripts" / "hermes.exe"
+    dispatch_hermes.write_text("", encoding="utf-8")
 
-    # Both env has matching version: ABI is consistent.
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _root: committed)
+    monkeypatch.setattr(
+        "pm.environments.venv_python", lambda _venv: committed / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        "pm.environments.venv_hermes", lambda _venv: committed / "Scripts" / "hermes.exe")
+
+    cmd = [str(dispatch_hermes), "-p", "code-reviewer-bangioi", "--cli",
+           "--accept-hooks", "chat", "-q", "hi"]
+    _swap_worker_argv_for_env_abi(cmd, tmp_path / "repo")
+
+    assert cmd[0] == str(committed / "Scripts" / "hermes.exe")
+    assert cmd[0] != str(committed / "Scripts" / "python.exe")  # not the env's python
+    assert cmd[0] != str(dispatch_hermes)  # not the original
+    assert cmd[1:] == ["-p", "code-reviewer-bangioi", "--cli",
+                       "--accept-hooks", "chat", "-q", "hi"]
+
+
+def test_swap_worker_argv_module_form_swaps_to_env_python(tmp_path, monkeypatch):
+    """Module-form argv keeps the interpreter slot — a mismatched interpreter becomes the env's python."""
+    from hermes_cli._worker_argv_prep import _swap_worker_argv_for_env_abi
+
+    committed = _write_venv(tmp_path / "installs" / "gen" / "venv", python_version="3.14")
+    (committed / "Scripts" / "hermes.exe").write_text("", encoding="utf-8")
+    # Store python is 3.11 — the exact mismatch the production install hit.
+    store_venv = _write_venv(tmp_path / "store", python_version="3.11")
+    store_python = store_venv / "Scripts" / "python.exe"
+
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _root: committed)
+    monkeypatch.setattr(
+        "pm.environments.venv_python", lambda _venv: committed / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        "pm.environments.venv_hermes", lambda _venv: committed / "Scripts" / "hermes.exe")
+
+    cmd = [str(store_python), "-m", "hermes_cli.main", "-p",
+           "code-reviewer-bangioi", "--cli", "chat"]
+    _swap_worker_argv_for_env_abi(cmd, tmp_path / "repo")
+
+    assert cmd[0] == str(committed / "Scripts" / "python.exe")
+    assert cmd[1:] == ["-m", "hermes_cli.main", "-p",
+                       "code-reviewer-bangioi", "--cli", "chat"]
+
+
+def test_swap_worker_argv_skips_unknown_abi(tmp_path, monkeypatch):
+    """A bare store python (no pyvenv.cfg at any walk-up level) yields ``unknown`` — no swap.
+
+    The conservative path on an unverifiable pair is to keep the argv the dispatcher
+    handed us, not to rewrite a working interpreter into an untested one.
+    """
+    from hermes_cli._worker_argv_prep import _swap_worker_argv_for_env_abi
+
+    committed = _write_venv(tmp_path / "installs" / "gen" / "venv", python_version="3.14")
+    (committed / "Scripts" / "hermes.exe").write_text("", encoding="utf-8")
+    bare_store_python = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none" / "python.exe"
+    bare_store_python.parent.mkdir(parents=True)
+    bare_store_python.write_text("", encoding="utf-8")
+
+    # Replacements exist on disk: a wrong swap would be observable as a change.
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _root: committed)
+    monkeypatch.setattr(
+        "pm.environments.venv_python", lambda _venv: committed / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        "pm.environments.venv_hermes", lambda _venv: committed / "Scripts" / "hermes.exe")
+
+    original = [str(bare_store_python), "-m", "hermes_cli.main", "-p",
+                "code-reviewer-bangioi", "--cli", "chat"]
+    cmd = list(original)
+    _swap_worker_argv_for_env_abi(cmd, tmp_path / "repo")
+
+    assert cmd == original
+
+
+def test_swap_worker_argv_skips_when_already_compatible(tmp_path, monkeypatch):
+    """Same version on both sides — the dispatcher's argv is left alone."""
+    from hermes_cli._worker_argv_prep import _swap_worker_argv_for_env_abi
+
+    committed = _write_venv(tmp_path / "installs" / "gen" / "venv", python_version="3.14")
+    (committed / "Scripts" / "hermes.exe").write_text("", encoding="utf-8")
+    matching_venv = _write_venv(tmp_path / "matching", python_version="3.14")
+    matching_python = matching_venv / "Scripts" / "python.exe"
+
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _root: committed)
+    monkeypatch.setattr(
+        "pm.environments.venv_python", lambda _venv: committed / "Scripts" / "python.exe")
+    monkeypatch.setattr(
+        "pm.environments.venv_hermes", lambda _venv: committed / "Scripts" / "hermes.exe")
+
+    original = [str(matching_python), "-m", "hermes_cli.main", "-p",
+                "code-reviewer-bangioi", "--cli", "chat"]
+    cmd = list(original)
+    _swap_worker_argv_for_env_abi(cmd, tmp_path / "repo")
+
+    assert cmd == original
+
+
+def test_env_supports_interpreter_is_tri_state(tmp_path, monkeypatch):
+    """The verdict has three states — ``unknown`` is a refusal to decide, not a mismatch."""
+    from pm.environments import AbiCompatibility, env_supports_interpreter
+
+    committed = _write_venv(tmp_path / "installs" / "gen" / "venv", python_version="3.14")
+
+    # Same-version pair: ABI is consistent.
     matching = _write_venv(tmp_path / "matching" / "venv", python_version="3.14")
     matching_python = matching / "Scripts" / "python.exe"
-    assert env_supports_interpreter(committed, matching_python)
+    assert env_supports_interpreter(
+        committed, matching_python) is AbiCompatibility.compatible
 
     # Versions differ: ABI mismatched.
     different = _write_venv(tmp_path / "different" / "venv", python_version="3.11")
     different_python = different / "Scripts" / "python.exe"
-    assert not env_supports_interpreter(committed, different_python)
+    assert env_supports_interpreter(
+        committed, different_python) is AbiCompatibility.incompatible
+
+    # Bare interpreter (no pyvenv.cfg at any walk-up candidate): unknown —
+    # NOT the old bool collapse of unknown to False (incompatible).
+    bare_interpreter = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none" / "python.exe"
+    bare_interpreter.parent.mkdir(parents=True)
+    bare_interpreter.write_text("", encoding="utf-8")
+    assert env_supports_interpreter(
+        committed, bare_interpreter) is AbiCompatibility.unknown
+
+    # Venv'd interpreter, missing-tree env: unknown as well.
+    missing_tree = tmp_path / "missing"
+    missing_tree.mkdir(parents=True)
+    assert env_supports_interpreter(
+        missing_tree, matching_python) is AbiCompatibility.unknown

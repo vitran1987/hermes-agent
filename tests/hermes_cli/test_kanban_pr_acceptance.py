@@ -230,3 +230,16 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+def test_owner_repo_placeholder_rejected_at_creation():
+    """The literal 'OWNER/REPO' placeholder must be rejected at creation time, not
+    silently accepted and then fail at completion with a confusing auth/infra error."""
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+    with pytest.raises(ValueError, match="placeholder"):
+        validate_contract("OWNER/REPO")
+    # Exact owner/repo and PR URL still pass.
+    assert validate_contract("acme/repo") == "acme/repo"
+    assert validate_contract("https://github.com/acme/repo/pull/7") == "https://github.com/acme/repo/pull/7"
+    assert validate_contract(None) == "local-only"
+    assert validate_contract("local-only") == "local-only"

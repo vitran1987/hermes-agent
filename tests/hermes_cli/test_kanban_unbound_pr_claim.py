@@ -226,3 +226,69 @@ def test_gate_leaves_no_state_change(board):
             "SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
             (tid,)).fetchone()[0] == 0
         assert len(_events(conn, tid, "completion_blocked_unbound_pr")) == 1
+
+
+# --- Defect 3: contract downgrade must not switch the gate OFF ---
+
+def test_downgrade_from_pr_url_to_local_only_is_refused(board):
+    """A card armed with a PR URL contract, then downgraded to local-only via
+    an ``edited`` event carrying ``old_contract``, must still refuse a
+    completion whose stored result names the PR."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="publish",
+                             completion_contract="https://github.com/acme/repo/pull/7")
+        # Simulate a prior run that stored a result naming the PR.
+        conn.execute(
+            "UPDATE tasks SET result='shipped in https://github.com/acme/repo/pull/7' WHERE id=?",
+            (tid,))
+        # Simulate the downgrade: an ``edited`` event with ``old_contract``
+        # carrying the PR URL, and the contract rewritten to local-only.
+        kb._append_event(conn, tid, "edited", {
+            "pm_contract_fix": True,
+            "old_contract": "https://github.com/acme/repo/pull/7",
+        })
+        conn.execute(
+            "UPDATE tasks SET completion_contract='local-only' WHERE id=?", (tid,))
+        # Complete with a new result that does NOT name the PR — the stored
+        # result still does, and the downgrade must not unbind it.
+        with pytest.raises(kb.UnboundPrClaimError) as exc:
+            kb.complete_task(conn, tid, result="done")
+        assert exc.value.reason == "downgrade"
+        assert kb.get_task(conn, tid).status != "done"
+        assert len(_events(conn, tid, "completion_blocked_unbound_pr")) == 1
+
+
+def test_downgrade_without_stored_pr_passes(board):
+    """A card downgraded from a PR URL to local-only, whose stored result does
+    NOT name a PR, must complete normally (no regression)."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="publish",
+                             completion_contract="https://github.com/acme/repo/pull/7")
+        # Simulate a prior run that stored a result NOT naming the PR.
+        conn.execute(
+            "UPDATE tasks SET result='done locally' WHERE id=?", (tid,))
+        # Simulate the downgrade.
+        kb._append_event(conn, tid, "edited", {
+            "pm_contract_fix": True,
+            "old_contract": "https://github.com/acme/repo/pull/7",
+        })
+        conn.execute(
+            "UPDATE tasks SET completion_contract='local-only' WHERE id=?", (tid,))
+        # Complete — no PR in the stored result, so the gate passes.
+        try:
+            kb.complete_task(conn, tid, result="done")
+        except kb.UnboundPrClaimError:
+            pytest.fail("downgrade without a stored PR must not trip the gate")
+
+
+def test_no_downgrade_event_passes(board):
+    """A local-only card with no downgrade event in the log must complete
+    normally (no regression)."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="publish", completion_contract="local-only")
+        conn.execute(
+            "UPDATE tasks SET result='done locally' WHERE id=?", (tid,))
+        try:
+            kb.complete_task(conn, tid, result="done")
+        except kb.UnboundPrClaimError:
+            pytest.fail("local-only card with no downgrade must not trip the gate")

@@ -2616,6 +2616,8 @@ class UnboundPrClaimError(ValueError):
         cannot be resolved from the contract or metadata (fail-closed).
       - ``"not_green"``: the PR is bound but its head is not green under the
         kernel's own acceptance rules.
+      - ``"downgrade"``: the contract was downgraded from a PR URL to
+        local-only, but the card's stored result still names that PR.
     """
 
     def __init__(self, task_id: str, pr_url: str, contract: str, reason: str,
@@ -2641,6 +2643,12 @@ class UnboundPrClaimError(ValueError):
                 f"an unknown-repo PR is exactly the shape that hides a red CI. "
                 f"Pass a full https://github.com/<owner>/<repo>/pull/<n> URL in "
                 f"metadata.published_pr, then retry."
+            )
+        elif reason == "downgrade":
+            msg = (
+                f"completion blocked: {task_id}'s contract was downgraded from "
+                f"{pr_url} to {contract}, but the card's stored result still "
+                f"names that PR. Re-arm the contract to the PR URL and retry."
             )
         else:  # not_green
             msg = (
@@ -2858,6 +2866,83 @@ def _gate_empty_completion(
     raise EmptyCompletionError(task_id)
 
 
+def _check_contract_downgrade(
+    conn: sqlite3.Connection,
+    task_id: str,
+    row,
+    _PR,
+) -> None:
+    """Defect 3: a contract downgrade (PR URL → local-only, or PR URL → a
+    narrower scope) must not switch the gate OFF.
+
+    The card's publication claim survives the downgrade: if the event log
+    shows the contract was mutated from a PR URL to a non-PR scope, and the
+    card's evidence (stored result, new result, summary, metadata) names a
+    PR, the gate must refuse — the downgrade tried to erase a PR claim the
+    card still makes. Re-derive the binding from the event log, not just the
+    current contract row.
+
+    The check is cheap: it only runs when the current contract is
+    ``local-only`` or absent (the downgrade target), and it scans the event
+    log for ``edited`` events with a ``pm_contract_fix`` payload key (the
+    shape the live downgrade used). If no such event exists, the function
+    returns immediately.
+    """
+    contract = row["completion_contract"] or "local-only"
+    # Only check for a downgrade if the current contract is local-only or
+    # absent — a PR URL or owner/repo contract is not a downgrade target.
+    if contract != "local-only":
+        return
+
+    # Scan the event log for contract mutations. The live downgrade used
+    # ``kind='edited'`` with a ``pm_contract_fix`` payload key carrying
+    # ``old_contract``. Check for any ``edited`` event that mentions a PR
+    # URL in the payload (the old contract).
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='edited' ORDER BY created_at DESC LIMIT 10",
+        (task_id,),
+    ).fetchall()
+    old_pr_url = None
+    for ev in events:
+        try:
+            payload = json.loads(ev["payload"]) if ev["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # The live downgrade used ``pm_contract_fix`` with ``old_contract``.
+        # Also check for any payload that mentions a PR URL in
+        # ``old_contract`` or ``completion_contract``.
+        old_contract = payload.get("old_contract") or payload.get("completion_contract")
+        if old_contract and _PR.fullmatch(old_contract):
+            old_pr_url = old_contract
+            break
+
+    if not old_pr_url:
+        return
+
+    # The contract was downgraded from a PR URL. Now check if the card's
+    # evidence (stored result) names a PR. If so, the downgrade tried to
+    # erase a PR claim the card still makes — refuse.
+    stored_result = row["result"] or ""
+    if _PR.search(stored_result):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_unbound_pr",
+                {
+                    "contract": contract,
+                    "unbound_prs": [old_pr_url],
+                    "reason": "downgrade",
+                    "old_contract": old_pr_url,
+                    "result_preview": _first_line(stored_result, 200) or None,
+                },
+            )
+        raise UnboundPrClaimError(
+            task_id, old_pr_url, contract, "downgrade",
+            f"contract was downgraded from {old_pr_url} to {contract}, "
+            f"but the card's stored result still names that PR. "
+            f"Re-arm the contract to the PR URL and retry.",
+        )
+
+
 def _gate_unbound_pr_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2914,8 +2999,22 @@ def _gate_unbound_pr_claim(
         if not re.search(r"github\.com/[\w./-]+/pull$", prefix):
             bare_refs.add(int(m.group(1)))
 
+    # Defect 3: a contract downgrade (PR URL → local-only, or PR URL → a
+    # narrower scope) must not switch the gate OFF. The card's publication
+    # claim survives the downgrade: if the event log shows the contract was
+    # mutated from a PR URL to a non-PR scope, and the card's evidence
+    # (stored result, new result, summary, metadata) names a PR, the gate
+    # must refuse — the downgrade tried to erase a PR claim the card still
+    # makes. Re-derive the binding from the event log, not just the current
+    # contract row.
     if not cited_urls and not bare_refs:
+        # No PR in the current evidence — but check if the contract was
+        # downgraded from a PR URL. If so, the stored result may name a PR
+        # that the downgrade tried to unbind.
+        _check_contract_downgrade(conn, task_id, row, _PR)
         return
+
+    _check_contract_downgrade(conn, task_id, row, _PR)
 
     # Resolve the contract's repo slug (for bare-ref resolution).
     contract_repo = None

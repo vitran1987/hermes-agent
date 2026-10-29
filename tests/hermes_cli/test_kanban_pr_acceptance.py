@@ -238,8 +238,17 @@ def test_owner_repo_placeholder_rejected_at_creation():
     from hermes_cli.kanban_pr_acceptance import validate_contract
     with pytest.raises(ValueError, match="placeholder"):
         validate_contract("OWNER/REPO")
+    # Case variants of the placeholder are rejected too: they match the case-permissive
+    # _REPO regex, but no repository exists under any of those casings, so a persisted
+    # contract could never be satisfied (collect_acceptance compares the published PR's
+    # repo slug case-sensitively) — the exact failure class this guard closes.
+    for variant in ("owner/repo", "Owner/Repo", "OWNER/Repo", "Owner/REPO"):
+        with pytest.raises(ValueError, match="placeholder"):
+            validate_contract(variant)
     # Exact owner/repo and PR URL still pass.
     assert validate_contract("acme/repo") == "acme/repo"
+    assert validate_contract("vitran1987/hermes-agent") == "vitran1987/hermes-agent"
+    assert validate_contract("Cong-ty-TNHH-Ban-Gioi/bangioi") == "Cong-ty-TNHH-Ban-Gioi/bangioi"
     assert validate_contract("https://github.com/acme/repo/pull/7") == "https://github.com/acme/repo/pull/7"
     assert validate_contract(None) == "local-only"
     assert validate_contract("local-only") == "local-only"

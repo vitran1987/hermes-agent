@@ -25,7 +25,7 @@ def validate_contract(value: str | None) -> str:
         return "local-only"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
         raise ValueError("completion_contract must be local-only, an exact owner/repo, or an exact GitHub PR URL")
-    if _REPO.fullmatch(value) and value == "OWNER/REPO":
+    if _REPO.fullmatch(value) and value.casefold() == "owner/repo":
         raise ValueError("completion_contract 'OWNER/REPO' is a placeholder — supply the exact owner/repo (e.g. 'acme/repo') or an exact GitHub PR URL")
     return value
 

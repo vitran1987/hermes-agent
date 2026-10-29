@@ -887,6 +887,9 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # 1 = completion evidence names a GitHub PR: the PR-claim gate must run on
+    # every completion attempt (see tasks.pr_claim_gate in SCHEMA_SQL).
+    ("pr_claim_gate", "pr_claim_gate INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

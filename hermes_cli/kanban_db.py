@@ -873,7 +873,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- 1 = the card's completion evidence names a GitHub PR, so the
+    -- completion_contract is the publication claim and the PR-claim gate
+    -- (unbound / unresolvable / not-green) must run on every completion
+    -- attempt. Set by the gate itself when it first sees a PR in the
+    -- evidence; cleared on successful completion. A contract downgrade
+    -- (PR URL -> local-only) must NOT clear it: the claim survives the
+    -- downgrade, and the gate re-derives the binding from the event log.
+    pr_claim_gate        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2725,11 +2733,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    _gate_unbound_pr_claim(
-        conn, task_id, result=result, summary=summary, metadata=metadata,
-    )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata,
+                                    result=result, summary=summary)
     if acceptance is False:
         return False
     with write_txn(conn):
@@ -2758,7 +2764,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       pr_claim_gate = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -2871,28 +2878,30 @@ def _check_contract_downgrade(
     task_id: str,
     row,
     _PR,
-) -> None:
-    """Defect 3: a contract downgrade (PR URL → local-only, or PR URL → a
+) -> Optional[str]:
+    """Defect 3: a contract downgrade (PR URL -> local-only, or PR URL -> a
     narrower scope) must not switch the gate OFF.
 
     The card's publication claim survives the downgrade: if the event log
-    shows the contract was mutated from a PR URL to a non-PR scope, and the
-    card's evidence (stored result, new result, summary, metadata) names a
-    PR, the gate must refuse — the downgrade tried to erase a PR claim the
-    card still makes. Re-derive the binding from the event log, not just the
-    current contract row.
+    shows the contract was mutated from a PR URL to a non-PR scope, the gate
+    must refuse — the downgrade tried to erase a PR claim the card still
+    makes. Re-derive the binding from the event log, not just the current
+    contract row.
 
     The check is cheap: it only runs when the current contract is
     ``local-only`` or absent (the downgrade target), and it scans the event
     log for ``edited`` events with a ``pm_contract_fix`` payload key (the
     shape the live downgrade used). If no such event exists, the function
     returns immediately.
+
+    Returns the downgraded-from PR URL when a downgrade is detected (the
+    caller arms the gate and refuses), else ``None``.
     """
     contract = row["completion_contract"] or "local-only"
     # Only check for a downgrade if the current contract is local-only or
     # absent — a PR URL or owner/repo contract is not a downgrade target.
     if contract != "local-only":
-        return
+        return None
 
     # Scan the event log for contract mutations. The live downgrade used
     # ``kind='edited'`` with a ``pm_contract_fix`` payload key carrying
@@ -2917,30 +2926,35 @@ def _check_contract_downgrade(
             break
 
     if not old_pr_url:
-        return
+        return None
 
     # The contract was downgraded from a PR URL. Now check if the card's
     # evidence (stored result) names a PR. If so, the downgrade tried to
-    # erase a PR claim the card still makes — refuse.
+    # erase a PR claim the card still makes — refuse, and let the caller
+    # arm the gate so the claim is enforced on every later attempt.
     stored_result = row["result"] or ""
-    if _PR.search(stored_result):
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "completion_blocked_unbound_pr",
-                {
-                    "contract": contract,
-                    "unbound_prs": [old_pr_url],
-                    "reason": "downgrade",
-                    "old_contract": old_pr_url,
-                    "result_preview": _first_line(stored_result, 200) or None,
-                },
-            )
-        raise UnboundPrClaimError(
-            task_id, old_pr_url, contract, "downgrade",
-            f"contract was downgraded from {old_pr_url} to {contract}, "
-            f"but the card's stored result still names that PR. "
-            f"Re-arm the contract to the PR URL and retry.",
+    if not _PR.search(stored_result):
+        # No PR in the stored result: the downgrade is clean, the card is
+        # not making a publication claim. Pass.
+        return None
+
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_unbound_pr",
+            {
+                "contract": contract,
+                "unbound_prs": [old_pr_url],
+                "reason": "downgrade",
+                "old_contract": old_pr_url,
+                "result_preview": _first_line(stored_result, 200) or None,
+            },
         )
+    raise UnboundPrClaimError(
+        task_id, old_pr_url, contract, "downgrade",
+        f"contract was downgraded from {old_pr_url} to {contract}, "
+        f"but the card's stored result still names that PR. "
+        f"Re-arm the contract to the PR URL and retry.",
+    )
 
 
 def _gate_unbound_pr_claim(
@@ -2953,6 +2967,12 @@ def _gate_unbound_pr_claim(
 ) -> None:
     """Refuse a completion whose evidence names a GitHub PR the card's
     ``completion_contract`` does not bind, or whose head is not green.
+
+    Raises :class:`UnboundPrClaimError` when the completion must be refused;
+    the refusal is recorded as an auditable ``completion_blocked_unbound_pr``
+    event before raising. The caller (``prepare_acceptance``) propagates the
+    exception to ``complete_task``, which propagates it to the tool handler,
+    which catches it and reports an actionable error to the worker.
 
     The contract is the card's publication claim: ``local-only``/absent makes
     no PR claim, ``owner/repo`` binds every PR of that repo, and an exact PR
@@ -2968,12 +2988,19 @@ def _gate_unbound_pr_claim(
     a bare ``#<n>`` / ``PR #<n>`` ref whose owning repo cannot be resolved is
     refused, not silently completed.
 
+    The gate is flag-driven: ``tasks.pr_claim_gate`` is set the first time a
+    PR appears in the completion evidence (or a contract downgrade is
+    detected) and stays set until the card completes. A card whose evidence
+    never named a PR and whose contract was never a PR URL is exempt — a
+    local-only card that merely mentions a PR as background context is not a
+    publication claim.
+
     Review approvals are exempt: a human vouches for the card and the approval
     is the record.
     """
     from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
     row = conn.execute(
-        "SELECT status, completion_contract, result, assignee FROM tasks WHERE id = ?",
+        "SELECT status, completion_contract, result, assignee, pr_claim_gate FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -2999,22 +3026,57 @@ def _gate_unbound_pr_claim(
         if not re.search(r"github\.com/[\w./-]+/pull$", prefix):
             bare_refs.add(int(m.group(1)))
 
-    # Defect 3: a contract downgrade (PR URL → local-only, or PR URL → a
+    # Defect 3: a contract downgrade (PR URL -> local-only, or PR URL -> a
     # narrower scope) must not switch the gate OFF. The card's publication
     # claim survives the downgrade: if the event log shows the contract was
-    # mutated from a PR URL to a non-PR scope, and the card's evidence
-    # (stored result, new result, summary, metadata) names a PR, the gate
-    # must refuse — the downgrade tried to erase a PR claim the card still
-    # makes. Re-derive the binding from the event log, not just the current
-    # contract row.
-    if not cited_urls and not bare_refs:
-        # No PR in the current evidence — but check if the contract was
-        # downgraded from a PR URL. If so, the stored result may name a PR
-        # that the downgrade tried to unbind.
-        _check_contract_downgrade(conn, task_id, row, _PR)
-        return
+    # mutated from a PR URL to a non-PR scope, the gate must refuse — the
+    # downgrade tried to erase a PR claim the card still makes. Re-derive the
+    # binding from the event log, not just the current contract row.
+    # Returns the downgraded-from PR URL when a downgrade is detected AND the
+    # stored result names a PR (the caller refuses); returns None otherwise.
+    downgrade_pr = _check_contract_downgrade(conn, task_id, row, _PR)
 
-    _check_contract_downgrade(conn, task_id, row, _PR)
+    if not cited_urls and not bare_refs and not downgrade_pr:
+        # No PR in the current evidence and no downgrade on record.
+        if row["pr_claim_gate"]:
+            # The flag is set from an earlier attempt: the card's publication
+            # claim is still open, so the contract must bind a PR. A
+            # local-only/absent contract cannot satisfy it.
+            if contract == "local-only":
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_unbound_pr",
+                        {
+                            "contract": contract,
+                            "unbound_prs": [],
+                            "reason": "unbound",
+                            "result_preview": _first_line(result, 200) or None,
+                            "summary_preview": _first_line(summary, 200) or None,
+                        },
+                    )
+                raise UnboundPrClaimError(
+                    task_id, "(no PR in this attempt's evidence)", contract, "unbound",
+                    "the card's earlier completion evidence named a PR; the "
+                    "contract must bind that PR (re-arm it) and the PR must be "
+                    "green before the card can complete",
+                )
+            # A PR-URL or owner/repo contract: fall through to the normal
+            # binding checks below (cited_urls/bare_refs are empty, so only
+            # the contract shape is validated).
+        else:
+            # No PR ever named, no downgrade: not a publication claim.
+            return
+    elif row["pr_claim_gate"] == 0:
+        # First time a PR appears in the evidence (or a downgrade is seen):
+        # the card is now making a publication claim — arm the gate so every
+        # later attempt is checked, even ones whose evidence no longer names
+        # the PR. This applies to local-only cards too: a local-only card
+        # that names a PR is a publication claim the contract does not bind
+        # (fail-closed).
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET pr_claim_gate = 1 WHERE id = ?", (task_id,),
+            )
 
     # Resolve the contract's repo slug (for bare-ref resolution).
     contract_repo = None

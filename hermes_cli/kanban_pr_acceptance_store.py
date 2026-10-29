@@ -10,11 +10,20 @@ def _snapshot(conn, task_id):
     return tuple(row) if row else None
 
 
-def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+def prepare_acceptance(conn, task_id, expected_run_id, metadata, *, result=None, summary=None):
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
     run_id, status, contract = snapshot
+    # The PR-claim gate runs BEFORE the green check: a completion whose
+    # evidence names a PR the contract does not bind (or a contract that was
+    # downgraded away from a PR) is refused here, with the refusal event
+    # recorded, so the worker retries with the bound PR instead of stalling.
+    # It is flag-driven (tasks.pr_claim_gate) so a card whose evidence never
+    # named a PR stays exempt — a local-only card that mentions a PR as
+    # background context is not a publication claim.
+    from hermes_cli.kanban_db import _gate_unbound_pr_claim
+    _gate_unbound_pr_claim(conn, task_id, result=result, summary=summary, metadata=metadata)
     if not contract or contract == "local-only":
         return None
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):

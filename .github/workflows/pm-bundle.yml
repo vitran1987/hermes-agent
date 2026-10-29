@@ -44,6 +44,15 @@ on:
       - 'uv.lock'
       - 'pyproject.toml'
       - '.github/workflows/pm-bundle.yml'
+      # Widen to cover the kanban PR-acceptance gate and its tests (PR #5):
+      # the fail-closed gate on unbound PR claims lives in hermes_cli/ and
+      # tools/, with tests in tests/hermes_cli/. Without these paths the
+      # workflow never triggers on PRs that touch the acceptance gate, so
+      # the hosted-runner check never reports on the head SHA and the
+      # kernel collector classifies the receipt as "missing".
+      - 'hermes_cli/**'
+      - 'tests/**'
+      - 'tools/**'
 
 permissions:
   contents: read

@@ -29,6 +29,7 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    _settings_summary,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -278,12 +279,54 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
+        last_logged_summary: Optional[str] = None
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
-        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs) "
+                    "settings: %s", interval,
+                    _settings_summary(settings))
         while self._running:
             try:
+                # Keep the effective caps honest against config.yaml: a
+                # mismatch is a one-shot WARNING (default) or a settings
+                # swap (opt-in reload). Interval changes always apply from
+                # the next sleep; the cap swap is a pure reference change
+                # the next tick reads — no live worker is ever touched.
+                try:
+                    new_settings = await _to_thread_process_service(
+                        dispatcher.check_config_staleness, _load_config, _kb)
+                    if new_settings is not None:
+                        dispatcher.settings = new_settings
+                        settings = new_settings
+                    new_interval = settings.interval
+                    if abs(new_interval - interval) > 1e-9:
+                        interval = new_interval
+                        logger.info(
+                            "kanban dispatcher: dispatch interval changed "
+                            "(applies from the next tick)",
+                        )
+                # Exceptional case: config read OR the mismatch/swap logic
+                # failed (corrupt config file, memory-read error, …). Log the
+                # traceback and continue with the in-memory settings — the
+                # staleness check is an advisory; the dispatcher must keep
+                # running even if config is unreadable.
+                except Exception:  # health: allow BLE001 -- deliberate catch-all boundary around the config read + staleness check; the watcher loop must survive any config-side failure (corrupt YAML, memory-read error) and keep dispatching with the in-memory settings
+                    logger.exception("kanban dispatcher: config staleness "
+                                     "check failed; continuing with "
+                                     "in-memory settings")
+
+                # Effective-cap visibility: logged on boot and whenever the
+                # values change (a staleness swap) — never per tick, so an
+                # operator can always see the caps in force without a log
+                # that repeats the same line every interval (the
+                # max_in_progress incident: the booted value was a secret,
+                # config edits silently ignored until restart).
+                summary = _settings_summary(settings)
+                if summary != last_logged_summary:
+                    logger.info(
+                        "kanban dispatcher: effective settings %s", summary)
+                    last_logged_summary = summary
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd

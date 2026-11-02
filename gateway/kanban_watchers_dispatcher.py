@@ -32,7 +32,13 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings, resolved at boot.
+
+    Without ``kanban.reload_dispatcher_settings_on_change`` they stay
+    process-lifetime (restart to apply); with the opt-in flag the watcher
+    re-resolves them on every tick and swaps them in when the resolved
+    values change (see ``_KanbanDispatcher.check_config_staleness``).
+    """
 
     interval: float
     max_spawn: Any
@@ -42,6 +48,47 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    config_signature: Optional[tuple] = None
+    """Fingerprint of the config source the values were resolved from;
+    ``None`` for legacy/boot resolution where staleness is not tracked."""
+
+    def as_tick_kwargs(self) -> dict:
+        """The ``dispatch_once`` kwargs — everything except ``interval`` (loop
+        pacing, not a per-tick argument)."""
+        return {k: v for k, v in asdict(self).items()
+                if k not in ("interval", "config_signature")}
+
+
+def _cfg_cap_keys(kanban_cfg: dict) -> dict:
+    """The ``kanban.*`` values the staleness check compares against the
+    in-memory settings: the raw (pre-resolution) caps plus any explicit
+    ``max_spawn``. Pure — no DB, no config file access."""
+    def _cfg_int(key: str) -> Optional[int]:
+        raw = kanban_cfg.get(key)
+        try:
+            val = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return val if val >= 1 else None
+    return {
+        "max_in_progress": _cfg_int("max_in_progress"),
+        "max_in_progress_per_profile": _cfg_int("max_in_progress_per_profile"),
+        "max_spawn": kanban_cfg.get("max_spawn"),
+    }
+
+
+def _kanban_dispatcher_mismatched_keys(settings: _DispatcherSettings,
+                                       kanban_cfg: dict) -> list:
+    """Which of the cap keys differ between on-disk config and in-memory
+    settings, after ``resolve_max_in_progress`` semantics (explicit positive
+    int wins; unset/invalid config resolves to the memory-derived default, so
+    a config missing the key only mismatches when the in-memory value was
+    explicit)."""
+    from hermes_cli import kanban_db_dispatch as _kbd
+    fresh = _cfg_cap_keys(kanban_cfg)
+    fresh["max_in_progress"] = _kbd.resolve_max_in_progress(fresh["max_in_progress"])
+    current = {k: getattr(settings, k) for k in fresh}
+    return [k for k in fresh if fresh[k] != current[k]]
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -183,7 +230,7 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        kwargs = self.settings.as_tick_kwargs()
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -212,6 +259,96 @@ class _KanbanDispatcher:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+
+    def check_config_staleness(self, load_config_fn: Any, kb: Any) -> Optional[_DispatcherSettings]:
+        """Compare the on-disk ``kanban.*`` values against the in-memory
+        settings and reconcile them. Returns the new settings when the
+        resolved values CHANGED (caller swaps them in), else ``None``.
+
+        Without ``kanban.reload_dispatcher_settings_on_change`` (the
+        default) the in-memory settings are authoritative for the process
+        lifetime: a mismatch is a one-shot WARNING naming both values and
+        the restart remedy — exactly the signal that was missing when
+        config edits to ``max_in_progress`` were silently ignored until the
+        next gateway restart. With the opt-in flag the settings are
+        re-resolved from disk and swapped in.
+
+        The swap is a pure reference change read by the NEXT tick's
+        ``as_tick_kwargs()`` — no mid-tick mutation, no claim, spawn,
+        requeue, park or terminate call on this path: live workers keep
+        running and a lowered cap simply stops new spawns (the
+        ``_tick_spawn_budget`` semantics: population may sit above the cap
+        until workers finish on their own).
+        """
+        try:
+            cfg = load_config_fn() or {}
+        except Exception:  # health: allow BLE001 -- deliberate catch-all boundary around the config load; any config-side failure is an advisory, not a reason to stop dispatching (keep the in-memory settings)
+            # Corrupt/unreadable config.yaml: nothing to compare against —
+            # keep the in-memory settings (the dispatcher must keep running).
+            return None
+        if not isinstance(cfg, dict):
+            return None
+        kanban_cfg = cfg.get("kanban", {})
+        if not isinstance(kanban_cfg, dict):
+            kanban_cfg = {}
+
+        live = self.settings
+        try:
+            mismatched = _kanban_dispatcher_mismatched_keys(live, kanban_cfg)
+        except Exception:  # health: allow BLE001 -- deliberate catch-all boundary around the mismatch computation (resolve_max_in_progress reads system memory); fail closed: keep the in-memory settings
+            logger.exception(
+                "kanban dispatcher: failed to compare config.yaml against "
+                "the in-memory dispatch settings; keeping the in-memory values")
+            return None
+        # Per-key views for the log lines: what config.yaml says vs what the
+        # running dispatcher enforces (max_in_progress resolved, so the
+        # memory-derived default is comparable).
+        cfg_view = _cfg_cap_keys(kanban_cfg)
+        try:
+            if "max_in_progress" in mismatched:
+                cfg_view["max_in_progress"] = _kbd().resolve_max_in_progress(
+                    cfg_view["max_in_progress"])
+        except Exception:  # health: allow BLE001 -- defensive: resolution already succeeded above; a second failure here would only corrupt the log line
+            cfg_view["max_in_progress"] = None
+        running_view = {k: getattr(live, k) for k in mismatched}
+        if not bool(kanban_cfg.get("reload_dispatcher_settings_on_change", False)):
+            if mismatched:
+                # Boot-resolved values are authoritative until restart: the
+                # operator's config.yaml edit has NOT taken effect. Warn once
+                # (repeat edits land on the same log line shape) naming both
+                # values and the remedy — the missing signal from the
+                # max_in_progress incident.
+                logger.warning(
+                    "kanban dispatcher: config.yaml disagrees with the "
+                    "in-memory dispatch settings: %s. This gateway loaded "
+                    "its settings at startup; restart the gateway or set "
+                    "kanban.reload_dispatcher_settings_on_change: true to "
+                    "apply the new values. Live values in force: %s.",
+                    ", ".join(f"{k}: config={cfg_view[k]!r} running={running_view[k]!r}"
+                              for k in mismatched),
+                    _settings_summary(live),
+                )
+            return None
+
+        if not mismatched:
+            return None
+        try:
+            new_settings = _resolve_dispatcher_settings(kanban_cfg, kb)
+        except Exception:  # health: allow BLE001 -- deliberate catch-all boundary around the re-resolve (reads system memory, parses config); the error is logged below and the in-memory values are kept (no partial swap)
+            logger.exception(
+                "kanban dispatcher: failed to re-resolve settings from "
+                "changed config; keeping the in-memory values")
+            return None
+        logger.warning(
+            "kanban dispatcher: config.yaml changed (%s); re-resolved "
+            "dispatch settings %s -> %s. Live workers are NOT touched — "
+            "the new caps only limit NEW spawns; population may stay "
+            "above a lowered cap until running workers finish on their own.",
+            ", ".join(f"{k}: {running_view[k]!r} -> {cfg_view[k]!r}"
+                      for k in mismatched),
+            _settings_summary(live), _settings_summary(new_settings),
+        )
+        return new_settings
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
@@ -326,10 +463,31 @@ def _default_profile_secret_scope():
         reset_secret_scope(token)
 
 
+def _settings_summary(settings: _DispatcherSettings) -> str:
+    """One-line human-readable summary of the dispatch caps in force."""
+    def _fmt(v):
+        return "unset" if v is None else str(v)
+    return (f"max_in_progress={_fmt(settings.max_in_progress)} "
+            f"max_in_progress_per_profile={_fmt(settings.max_in_progress_per_profile)} "
+            f"max_spawn={_fmt(settings.max_spawn)}")
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
+        if res is not None and getattr(res, "over_cap", None) is not None:
+            # The population is at/above the in-progress cap: typically a
+            # freshly lowered cap (hot reload) that existing workers exceed.
+            # Nothing is evicted — new spawns stop and the population drains
+            # on its own as workers finish.
+            logger.warning(
+                "kanban dispatcher [%s]: running population is at/above "
+                "the in-progress cap max_in_progress=%d; no new spawns until "
+                "the population drains below the cap. No running worker is "
+                "evicted or killed — tasks keep running to completion.",
+                slug, res.over_cap,
+            )
         if res is not None and getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.

@@ -323,6 +323,7 @@ class TestClassifyApiError:
         ("reset_field", "reset_value"),
         [
             ("resets_in_seconds", 3600),
+            ("resetsInSeconds", 3600),
             ("resets_at", "2026-08-24T10:00:00Z"),
             ("reset_at", "2026-08-24T10:00:00Z"),
             ("retry_after", 3600),

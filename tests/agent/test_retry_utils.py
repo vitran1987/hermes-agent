@@ -165,3 +165,59 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+# ---------------------------------------------------------------------------
+# extract_reset_seconds — 429 body reset-window extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractResetSeconds:
+    def test_camelcase_nested(self):
+        from agent.retry_utils import extract_reset_seconds
+        body = {"error": {"message": "Rate limited", "resetsInSeconds": 30995}}
+        assert extract_reset_seconds(body) == 30995.0
+
+    def test_snake_case_nested(self):
+        from agent.retry_utils import extract_reset_seconds
+        body = {"error": {"message": "Rate limited", "resets_in_seconds": 1800}}
+        assert extract_reset_seconds(body) == 1800.0
+
+    def test_top_level_camelcase(self):
+        from agent.retry_utils import extract_reset_seconds
+        body = {"resetsInSeconds": 600, "message": "slow down"}
+        assert extract_reset_seconds(body) == 600.0
+
+    def test_resets_at_epoch(self):
+        import time
+        from agent.retry_utils import extract_reset_seconds
+        body = {"resets_at": time.time() + 900}
+        result = extract_reset_seconds(body)
+        assert result is not None and 895 <= result <= 905
+
+    def test_retry_after_field(self):
+        from agent.retry_utils import extract_reset_seconds
+        body = {"error": {"message": "Rate limited", "retry_after": 120}}
+        assert extract_reset_seconds(body) == 120.0
+
+    def test_stringified_body_camelcase(self):
+        # Gateway that nests the field under a non-standard key: the structured
+        # lookup misses, but the stringified body still carries it.
+        from agent.retry_utils import extract_reset_seconds
+        body = {"error": {"message": "Rate limited", "meta": {"resetsInSeconds": 4500}}}
+        assert extract_reset_seconds(body) == 4500.0
+
+    def test_error_message_grammar(self):
+        from agent.retry_utils import extract_reset_seconds
+        assert extract_reset_seconds(None, "resets in 4hr 5min") == 4 * 3600 + 5 * 60
+
+    def test_no_reset_info(self):
+        from agent.retry_utils import extract_reset_seconds
+        assert extract_reset_seconds({"error": {"message": "Rate limited"}}, "Rate limited") is None
+        assert extract_reset_seconds(None, "") is None
+        assert extract_reset_seconds(None) is None
+
+    def test_zero_resets_in_seconds_ignored(self):
+        from agent.retry_utils import extract_reset_seconds
+        body = {"error": {"resets_in_seconds": 0, "retry_after": 60}}
+        assert extract_reset_seconds(body) == 60.0

@@ -76,6 +76,54 @@ class TestRecordNousRateLimit:
             state = json.load(f)
         assert state["reset_seconds"] == pytest.approx(120, abs=2)
 
+    def test_camelcase_resets_in_seconds_body_outranks_default_cooldown(self, rate_guard_env):
+        # OpenRouter-style 429 body: the gateway names a 30995 s window in camelCase.
+        # Without the fix this collapsed to the 300 s default cooldown.
+        from agent.nous_rate_guard import record_nous_rate_limit, _state_path
+
+        record_nous_rate_limit(
+            headers=None,
+            error_context={
+                "body": {"error": {"message": "Rate limited", "resetsInSeconds": 30995}},
+                "message": "Rate limited",
+            },
+        )
+
+        with open(_state_path(), encoding="utf-8-sig") as f:
+            state = json.load(f)
+        assert state["reset_seconds"] == pytest.approx(30995, abs=5)
+
+    def test_snake_case_resets_in_seconds_body_outranks_default_cooldown(self, rate_guard_env):
+        from agent.nous_rate_guard import record_nous_rate_limit, _state_path
+
+        record_nous_rate_limit(
+            headers=None,
+            error_context={
+                "body": {"error": {"message": "Rate limited", "resets_in_seconds": 1800}},
+                "message": "Rate limited",
+            },
+        )
+
+        with open(_state_path(), encoding="utf-8-sig") as f:
+            state = json.load(f)
+        assert state["reset_seconds"] == pytest.approx(1800, abs=5)
+
+    def test_body_reset_outranks_default_but_not_headers(self, rate_guard_env):
+        # Header reset still wins over the body's own wait (existing precedence).
+        from agent.nous_rate_guard import record_nous_rate_limit, _state_path
+
+        record_nous_rate_limit(
+            headers={"x-ratelimit-reset-requests-1h": "3600"},
+            error_context={
+                "body": {"error": {"resetsInSeconds": 30995}},
+                "message": "Rate limited",
+            },
+        )
+
+        with open(_state_path(), encoding="utf-8-sig") as f:
+            state = json.load(f)
+        assert state["reset_seconds"] == pytest.approx(3600, abs=5)
+
 
 
 class TestNousRateLimitRemaining:

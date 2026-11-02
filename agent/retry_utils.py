@@ -77,6 +77,8 @@ _RESETS_IN_RE = re.compile(
 _RETRY_AFTER_SECONDS_RE = re.compile(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", re.IGNORECASE)
 # The plan usage-limit body field as it appears once stringified: ``'resets_in_seconds': 30995``.
 _RESETS_IN_SECONDS_FIELD_RE = re.compile(r"resets_in_seconds\W{1,4}(\d+(?:\.\d+)?)", re.IGNORECASE)
+# camelCase variant (OpenAI-compatible gateways, e.g. OpenRouter): ``"resetsInSeconds": 30995``.
+_RESETS_IN_SECONDS_CAMEL_RE = re.compile(r"resetsInSeconds\W{1,4}(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
 def _quota_reset_seconds(m: re.Match[str]) -> float:
@@ -115,6 +117,42 @@ def reset_delay_from_message(message: str) -> Optional[float]:
         m = pattern.search(message)
         if m and (seconds := to_seconds(m)) is not None:
             return seconds
+    return None
+
+
+def extract_reset_seconds(body: Any, error_msg: str = "") -> Optional[float]:
+    """Seconds-until-reset from a 429 response body (structured fields first, then the
+    stringified body / error message for gateways that nest the field under a non-standard
+    key). None when the response names no reset window.
+
+    Precedence: ``resets_in_seconds`` / ``resetsInSeconds`` (top level, then nested under
+    ``error``) → ``resets_at`` / ``reset_at`` epoch → ``retry_after`` → free-text grammar.
+    """
+    if isinstance(body, dict):
+        for payload in (body, body.get("error") if isinstance(body.get("error"), dict) else None):
+            if not isinstance(payload, dict):
+                continue
+            for key in ("resets_in_seconds", "resetsInSeconds"):
+                value = payload.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                    return float(value)
+        for payload in (body, body.get("error") if isinstance(body.get("error"), dict) else None):
+            if not isinstance(payload, dict):
+                continue
+            for key in ("resets_at", "reset_at"):
+                value = payload.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return max(0.0, float(value) - time.time())
+            value = payload.get("retry_after")
+            if (seconds := parse_retry_after_seconds(value)) is not None:
+                return seconds
+    text = f"{body} {error_msg}" if body is not None else error_msg
+    if text:
+        for pattern in (_RESETS_IN_SECONDS_FIELD_RE, _RESETS_IN_SECONDS_CAMEL_RE):
+            m = pattern.search(text)
+            if m:
+                return float(m.group(1))
+        return reset_delay_from_message(text)
     return None
 
 

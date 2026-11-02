@@ -15,7 +15,7 @@ import os
 import time
 from typing import Any, Mapping, Optional
 from utils import atomic_write_text
-from agent.retry_utils import parse_retry_after_seconds
+from agent.retry_utils import extract_reset_seconds, parse_retry_after_seconds
 from agent.rate_limit_tracker import (
     _BUCKET_TAGS, _fmt_seconds, _safe_float, _safe_int, has_rate_limit_headers, lower_headers,
 )
@@ -76,6 +76,14 @@ def record_nous_rate_limit(
             reset_at = float(ctx_reset)
     if reset_at is None and (header_seconds := _parse_reset_seconds(headers)) is not None:
         reset_at = now + header_seconds
+    if reset_at is None and isinstance(error_context, dict):
+        # The 429 body's own wait (resets_in_seconds / resetsInSeconds / retry_after /
+        # free-text grammar) outranks the default cooldown: a gateway that names a 30995 s
+        # window must not be collapsed to 300 s.
+        body = error_context.get("body")
+        message = error_context.get("message") or ""
+        if (body_seconds := extract_reset_seconds(body, message)) is not None:
+            reset_at = now + body_seconds
     if reset_at is None:
         reset_at = now + default_cooldown
 

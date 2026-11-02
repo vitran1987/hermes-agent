@@ -1235,7 +1235,7 @@ _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
-_RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
+_RESET_FIELDS = ("resets_in_seconds", "resetsInSeconds", "resets_at", "reset_at", "retry_after")
 _RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
 
 

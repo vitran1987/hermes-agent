@@ -3714,12 +3714,15 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
             message = payload.get("error")
         if isinstance(message, str) and message.strip():
             context["message"] = message.strip()
-        reset = next((payload.get(k) for k in ("resets_at", "reset_at") if payload.get(k) not in {None, ""}), None)
+        reset = next((payload.get(k) for k in ("resets_at", "reset_at", "resetsInSeconds") if payload.get(k) not in {None, ""}), None)
         if reset is not None:
             context["reset_at"] = reset
         elif isinstance(payload.get("resets_in_seconds"), (int, float)):
             # Codex/ChatGPT usage-limit bodies carry a relative window beside (or instead of) the epoch.
             context["reset_at"] = time.time() + float(payload["resets_in_seconds"])
+        elif isinstance(payload.get("resetsInSeconds"), (int, float)):
+            # camelCase variant (OpenAI-compatible gateways, e.g. OpenRouter).
+            context["reset_at"] = time.time() + float(payload["resetsInSeconds"])
         _set_reset_from_retry_after(context, payload.get("retry_after"))
     headers = getattr(getattr(error, "response", None), "headers", None)
     if headers:

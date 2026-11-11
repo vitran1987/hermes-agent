@@ -496,7 +496,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
-            verdict, reason, _, _, transport_failed = judge_goal(
+            verdict, reason, parse_failed, _, transport_failed = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
         finally:
             if affinity_token is not None:
@@ -505,10 +505,14 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
         return
-    if transport_failed:
-        # ``judge_goal`` fails open to ``continue`` on transport errors (relay 400, auth, timeout);
-        # an unreachable judge is not a human "not done" and must not reject the handoff (#83610).
-        logger.warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
+    if transport_failed or (parse_failed and verdict not in {"blocked", "wait"}):
+        # ``judge_goal`` fails open to ``continue`` on transport errors (relay 400, auth, timeout)
+        # AND on unusable output (empty / non-JSON reply — ``_parse_judge_response``, which is
+        # documented fail-open and sets ``parse_failed``). Neither is a human "not done", so neither
+        # may reject the handoff: dropping ``parse_failed`` here wedged goal_mode cards whose judge
+        # never answered (#83610 for transport, same wedge for a broken judge model). A real verdict
+        # carried by unusable output (``blocked`` / ``wait``) still gates below.
+        logger.warning("goal judge unusable (%s), allowing lifecycle handoff", reason)
         return
     if verdict == "done":
         return

@@ -19,7 +19,7 @@ import uuid
 from contextlib import suppress
 
 from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
-from hermes_cli.gateway_connection import DISCONNECTED, CallStopped, lost_before
+from hermes_cli.gateway_connection import DISCONNECTED, NOT_SENT, CallStopped, lost_before
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ class GatewayAgent:
     def __init__(self, *, session_db=None, session_id=None, model=None, provider=None, base_url=None,
                  api_mode=None, max_iterations=90, quiet_mode=True, tool_progress_mode="all",
                  reasoning_config=None, service_tier=None, clarify_callback=None, connection_callback=None,
+                 connection_update_callback=None,
                  reasoning_callback=None, thinking_callback=None, tool_progress_callback=None,
                  tool_start_callback=None, tool_complete_callback=None, stream_delta_callback=None,
                  tool_gen_callback=None, notice_callback=None, notice_clear_callback=None,
@@ -114,7 +115,10 @@ class GatewayAgent:
         self.quiet_mode = quiet_mode
         self._service_tier = None
         self.clarify_callback = clarify_callback
+        # The manage_connections card: the gateway runs the operation and streams connection.request /
+        # connection.update; the card answers through connection_respond / connection_retry.
         self.connection_callback = connection_callback
+        self.connection_update_callback = connection_update_callback
         self._reasoning_callback = None
         self._show_reasoning_sent = None
         self.thinking_callback = thinking_callback
@@ -402,6 +406,10 @@ class GatewayAgent:
         self._apply_info(state.info)
         if state.usage:
             self.apply_session_usage(state.usage)
+        self._sync_show_reasoning()
+        notice = self._lost_turn_notice()
+        if notice:
+            self._emit_print(notice)
 
     # -- reasoning display -------------------------------------------------------------------
     @property
@@ -414,16 +422,23 @@ class GatewayAgent:
         sink's presence is what makes the agent ask the provider for reasoning. The gateway agent
         gets the same switch: the session's ``show_reasoning`` display flag, sent on each change."""
         self._reasoning_callback = callback
-        wanted = (self.session_id, callback is not None)
-        if wanted == self._show_reasoning_sent:  # per session: a rotated id gets its own flag
+        self._sync_show_reasoning()
+
+    def _sync_show_reasoning(self):
+        """Sent unless this viewer already set the value: a session it attaches (/new, /resume, /branch)
+        may hold another viewer's "1". A "0" outlives a redial (a restarted gateway starts with the
+        flag unset, read as off); a "1" is set again on each gateway life."""
+        show = self._reasoning_callback is not None
+        sent = self._show_reasoning_sent
+        if sent and sent[:2] == (self.session_id, show) and (not show or sent[2] == self.connection.epoch):
             return
         try:
             self.connection.call("config.set", session_id=self.session_id, key="show_reasoning",
-                                 value="1" if wanted[1] else "0", timeout=10)
+                                 value="1" if show else "0", timeout=10)
         except GatewayClientError as exc:
             logger.debug("config.set show_reasoning failed: %s", exc)
             return
-        self._show_reasoning_sent = wanted
+        self._show_reasoning_sent = (self.session_id, show, self.connection.epoch)
 
     @property
     def service_tier(self):
@@ -756,9 +771,9 @@ class GatewayAgent:
             try:
                 # Inside the try: staging an image is a gateway call, and its failure is a failed turn.
                 # Building the params consumes a ``/model --once`` pick (``_take_turn_route``).
-                state = self._state()
-                if state.gaps != state.attached_gaps:  # a replay gap between turns retired the subscription
-                    self.connection.reattach(turn.session_id, abandon=self._stop(turn))
+                notice = self._prepare_submit(turn)
+                if notice:
+                    return self._unadmitted(history, user_message, notice)
                 params = self._submit_params(user_message, persist_user_message, turn_author)
                 if self._stop(turn)():
                     raise CallStopped("prompt.submit")
@@ -776,6 +791,8 @@ class GatewayAgent:
                 return self._failed(history, user_message, str(exc),
                                     failure_reason="session_busy" if busy else None, retryable=busy)
             except GatewayClientError as exc:
+                if str(exc) == NOT_SENT:
+                    return self._unadmitted(history, user_message, str(exc))
                 return self._failed(history, user_message, str(exc), failure_reason="gateway_connection")
             if (receipt or {}).get("voice_stopped") is True:
                 return self._voice_stopped(history)
@@ -836,6 +853,23 @@ class GatewayAgent:
         terminal stops them. Past Ctrl-C's settle bound they still run, bounded by their own timeouts."""
         return lambda: not self._owns(turn)
 
+    def _prepare_submit(self, turn):
+        """Before a prompt is sent: re-attach after a replay gap, give a redialled (restarted) owner the
+        reasoning flag again, and return the notice of a turn lost in that restart: a prompt queued
+        behind it would wait with no end, so it is refused until ``/discard``."""
+        state = self._state()
+        if state.gaps != state.attached_gaps:  # a replay gap between turns retired the subscription
+            self.connection.reattach(turn.session_id, abandon=self._stop(turn))
+        self.connection.start()
+        self._sync_show_reasoning()
+        notice = self._lost_turn_notice()
+        return f"Your message was not sent.\n{notice}" if notice else ""
+
+    def _lost_turn_notice(self):
+        from hermes_cli.gateway_chat_view import pending_lines
+        pending = self._state().pending
+        return "\n".join(pending_lines(pending)) if any(row["status"] == "unknown" for row in pending) else ""
+
     def _pump(self, stream_callback, starts, turn):
         """Dispatch frames until this admission's ``message.complete``; returns its payload, or the
         transport error (disconnect)."""
@@ -894,6 +928,7 @@ class GatewayAgent:
             if row.get("status") == "unknown":
                 return lost  # its completion was the one the hole lost: no other is owed
             turn.gapped |= row.get("status") != "queued"  # one still queued lost nothing
+            self._restore_connection_card(snapshot.get("pending_connection"))
             for prompt in snapshot.get("prompts") or []:
                 if row.get("status") == "started" and prompt.get("execution_generation") == row.get("execution_generation") \
                         and prompt.get("prompt_id") not in turn.answered and not stop():
@@ -951,6 +986,12 @@ class GatewayAgent:
     def _on_tool_generating(self, payload, stream_callback, starts):
         if self.tool_gen_callback is not None:
             self.tool_gen_callback(payload.get("name"))
+
+    def _on_tool_progress(self, payload, stream_callback, starts):
+        if self.tool_progress_callback is not None:
+            self.tool_progress_callback("tool.progress", payload.get("name"), payload.get("message"), None,
+                                        tool_call_id=payload.get("tool_id"), progress=payload.get("progress"),
+                                        total=payload.get("total"), percent=payload.get("percent"))
 
     def _on_tool_start(self, payload, stream_callback, starts):
         self._close_segment(starts)
@@ -1097,8 +1138,35 @@ class GatewayAgent:
                              execution_generation=payload.get("execution_generation", self._generation),
                              prompt_id=payload.get("prompt_id"), answer=str(answer))
 
+    def _on_connection_request(self, payload, stream_callback, starts):
+        if self.connection_callback is not None:
+            self.connection_callback(payload)
+
+    def _on_connection_update(self, payload, stream_callback, starts):
+        if self.connection_update_callback is not None:
+            self.connection_update_callback(payload)
+
+    def _restore_connection_card(self, pending):
+        """After a replay gap, the resume snapshot's open operation: (re)open the card from it, or
+        close a stale card when none remains (the gap may have eaten the request or the settle)."""
+        if pending:
+            if self.connection_callback is not None:
+                self.connection_callback(pending)
+        elif self.connection_update_callback is not None:
+            self.connection_update_callback({"settled": True})
+
+    def connection_respond(self, op_id, result):
+        """The card's answer to the gateway's open operation (``connection.respond``); returns its result."""
+        return self.connection.call("connection.respond", op_id=op_id, result=result,
+                                    owner={"type": "session", "session_id": self.session_id})
+
+    def connection_retry(self, name):
+        """The card's Try again on a failed or expired row: the gateway re-mints it on the open operation."""
+        return self.connection.call("connectors.connect", connectors=[name], reconnect=True,
+                                    owner={"type": "session", "session_id": self.session_id})
+
     def _answer_request(self, frame):
-        """A gateway server→client request (``sudo``, ``secret``, ``clarify``): main's own modal
+        """A gateway server→client request (``sudo``, ``secret``, the ``vault.*`` prompts, ``clarify``): main's own modal
         answers it on this (agent) thread, through the callback HermesCLI registered for the turn; the
         answer travels only in the JSON-RPC response frame."""
         method = frame["method"]
@@ -1129,21 +1197,7 @@ class GatewayAgent:
             logger.debug("modal withdraw for %s failed", current[1], exc_info=True)
 
     def _ask_clarify(self, params):
-        """Main's batch clarify panel (``clarify_callback(questions)``) for the whole question set."""
-        questions = [{"qid": q.get("qid"), "question": q.get("question") or "",
-                      "choices": list(q.get("choices") or []), "multi_select": bool(q.get("multi_select"))}
-                     for q in params.get("questions") or [] if isinstance(q, dict) and q.get("qid")]
-        if self.clarify_callback is None or not questions:
-            return {"outcome": "cancelled"}
-        reply = self.clarify_callback(questions)
-        if not isinstance(reply, dict):
-            return {"outcome": "cancelled"}
-        answers = {qid: (value if isinstance(value, str) or value is None else json.dumps(value))
-                   for qid, value in (reply.get("answers") or {}).items()}
-        out = {"answers": answers}
-        if reply.get("outcome") in ("submitted", "timed_out", "cancelled"):
-            out["outcome"] = reply["outcome"]
-        return out
+        return clarify_reply(self.clarify_callback, params)
 
     def _ask_sudo(self, params):
         from tools.terminal_tool import _get_sudo_password_callback
@@ -1172,6 +1226,37 @@ class GatewayAgent:
                 callbacks.save_env_value_secure = saver
         return captured[0] if captured else ""
 
+    def _ask_vault_unlock(self, params):
+        """Main's masked password-manager unlock panel, through the callback HermesCLI registered."""
+        from agent.vault_backends.unlock import get_unlock_prompt_callback
+        callback = get_unlock_prompt_callback()
+        if callback is None:
+            return ""
+        return callback(str(params.get("backend") or ""), str(params.get("display_name") or "")) or ""
+
+    def _ask_vault_save_login(self, params):
+        """Main's two-step "save this login" panel. The gateway stores the login in the vault, so the
+        identifier and password go back as one JSON string in the response frame, as the cards send it."""
+        from agent.vault_backends.unlock import get_save_login_prompt_callback
+        callback = get_save_login_prompt_callback()
+        if callback is None:
+            return ""
+        answer = callback(str(params.get("origin") or ""), str(params.get("site") or ""))
+        if not isinstance(answer, dict) or not answer.get("password"):
+            return ""
+        try:
+            return json.dumps({"identifier": str(answer.get("identifier") or ""), "password": str(answer["password"])})
+        finally:
+            answer.clear()
+
+    def _ask_vault_code(self, params):
+        """Main's one-time-code panel, through the callback HermesCLI registered."""
+        from agent.vault_backends.unlock import get_code_prompt_callback
+        callback = get_code_prompt_callback()
+        if callback is None:
+            return ""
+        return callback(str(params.get("site") or ""), str(params.get("hint") or "")) or ""
+
     # -- result --------------------------------------------------------------------------------
     def _user_row(self, user_message):
         staged = self._pending_cli_user_message
@@ -1187,6 +1272,13 @@ class GatewayAgent:
         self._give_back_turn_route()  # nothing was admitted: a ``/model --once`` pick is still owed
         self._emit_print(t("cli.voice.stop_phrase_typed"))
         return {**_RESULT_DEFAULTS, "messages": list(history), "voice_stopped": True, "session_id": self.session_id}
+
+    def _unadmitted(self, history, user_message, error):
+        """A turn the owner never saw (a pre-submit notice, or a submit that was never sent): the CLI
+        keeps its local state (no history row, the ``/model --once`` pick and notes) for the resend."""
+        self._give_back_turn_route()
+        return {**self._failed(history, user_message, error, failure_reason="gateway_connection"),
+                "messages": history, "admitted": False}
 
     def _failed(self, history, user_message, error, *, failure_reason=None, retryable=False):
         """``failure_reason="gateway_connection"``: the CLI shows ``error`` as written instead of
@@ -1375,10 +1467,32 @@ def _moa_handler(kind):
     return handler
 
 
+def clarify_reply(callback, params) -> dict:
+    """Main's batch clarify panel (``callback(questions)``, ``HermesCLI._clarify_callback``) answering a
+    ``clarify`` server request's whole question set: its ``ClarifyResult``."""
+    questions = [{"qid": q.get("qid"), "question": q.get("question") or "",
+                  "choices": list(q.get("choices") or []), "multi_select": bool(q.get("multi_select"))}
+                 for q in params.get("questions") or [] if isinstance(q, dict) and q.get("qid")]
+    if callback is None or not questions:
+        return {"outcome": "cancelled"}
+    reply = callback(questions)
+    if not isinstance(reply, dict):
+        return {"outcome": "cancelled"}
+    answers = {qid: (value if isinstance(value, str) or value is None else json.dumps(value))
+               for qid, value in (reply.get("answers") or {}).items()}
+    out = {"answers": answers}
+    if reply.get("outcome") in ("submitted", "timed_out", "cancelled"):
+        out["outcome"] = reply["outcome"]
+    return out
+
+
 _SECRET_LOCK = threading.Lock()
 _SERVER_REQUESTS = {
     "sudo": GatewayAgent._ask_sudo,
     "secret": GatewayAgent._ask_secret,
+    "vault.unlock_prompt": GatewayAgent._ask_vault_unlock,
+    "vault.save_login": GatewayAgent._ask_vault_save_login,
+    "vault.code": GatewayAgent._ask_vault_code,
     "clarify": GatewayAgent._ask_clarify,
 }
 
@@ -1386,6 +1500,7 @@ _HANDLERS = {
     "message.delta": GatewayAgent._on_delta,
     "message.interim": GatewayAgent._on_interim,
     "tool.generating": GatewayAgent._on_tool_generating,
+    "tool.progress": GatewayAgent._on_tool_progress,
     "tool.start": GatewayAgent._on_tool_start,
     "tool.complete": GatewayAgent._on_tool_complete,
     "todo.updated": GatewayAgent._on_todo,
@@ -1402,4 +1517,6 @@ _HANDLERS = {
     "review.summary": GatewayAgent._on_review_summary,
     "approval.request": GatewayAgent._on_approval,
     "clarify.request": GatewayAgent._on_clarify,
+    "connection.request": GatewayAgent._on_connection_request,
+    "connection.update": GatewayAgent._on_connection_update,
 }

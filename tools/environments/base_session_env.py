@@ -9,6 +9,8 @@ import re
 import shlex
 from typing import Iterable
 
+from hermes_cli._early_recovery import _GIT_LOCATION_ENV
+
 # Bridged per-session vars (gateway.session_context._VAR_MAP) are injected fresh onto every
 # command's process env and must NEVER persist in the shared bash snapshot: one long-lived
 # backend serves many sessions, so a snapshot carrying the FIRST session's HERMES_SESSION_ID
@@ -81,7 +83,15 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID "
+        # Git location pointers (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_COMMON_DIR — the core's
+        # own ``_GIT_LOCATION_ENV`` set in hermes_cli/_early_recovery.py) describe ONE checkout. A
+        # snapshot taken while the parent session worked inside a worktree would re-assert them on
+        # every later ``source``, so a fresh worker session inherits a FOREIGN checkout: ``git
+        # rev-parse`` resolves the wrong repo and pre-push guards false-BLOCK. Unlike the session
+        # vars above, these are the user's own shell exports — a backend that never had them set
+        # stays clean either way, so the unset is safe and import-free.
+        f"{' '.join(_GIT_LOCATION_ENV)}{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
 

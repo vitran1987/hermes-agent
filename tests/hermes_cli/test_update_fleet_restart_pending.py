@@ -1160,3 +1160,157 @@ def test_completion_arms_obligation_with_checkout_sha_when_head_capture_empty(mo
         {"expected_sha": "", "receipt": {"update_id": "u1"}, "windows_resume": None})
 
     assert armed == [checkout]
+
+
+# ── Exited recorded gateways must discharge (2026-11-15 host-wide spawn refusal) ──
+#
+# An armed obligation whose inventory names gateways that have since exited could never settle:
+# `collect_fleet_versions` yields no row for a dead PID, so those identities can never enter
+# `covered`, so `_marker_only_restart_obsolete` returned False forever. While armed, every later
+# CLI launch re-entered the update fence (`_update_fenced` -> `draining/update_paused`) and worker
+# spawns were refused as a side effect of merely launching — measured 82 runs / 24 h whose last
+# output was `Kanban owner refused: Gateway inaccessible: windows_breakaway_unavailable` (a blanket
+# label over ANY Popen OSError, not a Job-Object denial: 3 concurrent CREATE_BREAKAWAY_FROM_JOB
+# spawns succeed on this host). These tests pin the discharge and every fail-closed neighbour.
+
+
+def _dead_inventory_marker(expected_sha, rows):
+    """Arm the HOST record with an inventory whose gateways already exited."""
+    path = host_obligation.host_obligation_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 1, "started": 0.0, "pid": 424242, "armed_by_profile": "default",
+        "expected_sha": expected_sha,
+        "inventory": {"version": 1, "runtimes": rows},
+    }), encoding="utf-8")
+    return path
+
+
+def _patch_dead_pids(monkeypatch):
+    """Every recorded PID is gone; the fleet sees nothing (the shape the storm produced)."""
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **kw: [])
+
+
+def test_obligation_discharges_when_recorded_gateways_exited_but_live_fleet_is_current(monkeypatch, capsys):
+    """The incident's exact shape: recorded PIDs dead, every LIVE lane already on the checkout.
+
+    Nothing is left for the restart phase to fix, yet before the judge this record stayed armed
+    forever (the live lanes belong to other profiles, so ``owed`` could never be covered). While
+    armed, every later CLI launch re-entered the update fence and worker spawns were refused.
+    """
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [
+        {"kind": "gateway", "profile": "accountant", "pid": 7652},
+        {"kind": "gateway", "profile": "cco", "pid": 37248},
+        {"kind": "gateway", "profile": "coo", "pid": 11572},
+    ])
+    _patch_marker_sha(monkeypatch, sha)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kw: [{"profile": "tl", "pid": 22608, "code_sha": sha,
+                       "code_version": "0.23.1", "state": "current"}],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert capsys.readouterr().err == ""
+    assert not update_cmd_fleet._fleet_restart_obligation_armed()
+    assert update_cmd._pending_fleet_restart_needed(receipt={}, pending_manual=[]) is False
+
+
+def test_dead_fleet_with_nothing_live_keeps_the_obligation(monkeypatch, capsys):
+    """Contract C3: unanswered-by-anything is NOT recovery — a dead fleet stays owed.
+
+    The update killed the gateway and nothing came back: this warning replaces the exit-1 that
+    contract C3 owes the operator, so liveness alone must never settle it.
+    """
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [{"kind": "gateway", "profile": "default", "pid": 4242}])
+    _patch_marker_sha(monkeypatch, sha)
+    _patch_dead_pids(monkeypatch)  # no PID alive, fleet empty
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_obligation_kept_when_a_recorded_gateway_is_still_alive(monkeypatch, capsys):
+    """A live gateway that the update never restarted still owes the restart."""
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [
+        {"kind": "gateway", "profile": "default", "pid": 4242},
+        {"kind": "gateway", "profile": "coder", "pid": 4243},
+    ])
+    _patch_marker_sha(monkeypatch, sha)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4243)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **kw: [])
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_obligation_kept_when_a_live_gateway_still_serves_stale_code(monkeypatch, capsys):
+    """A successor exists but is stale: its restart is still owed even though the recorded PID is gone."""
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [{"kind": "gateway", "profile": "default", "pid": 4242}])
+    _patch_marker_sha(monkeypatch, sha)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kw: [{"profile": "default", "pid": 99, "code_sha": "0" * 40,
+                       "code_version": "0.20.0", "state": "stale"}],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_dead_identities_are_pruned_while_a_stale_successor_keeps_the_obligation(monkeypatch, capsys):
+    """Pruning is per identity: one exited gateway must not mask another profile's stale one."""
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [
+        {"kind": "gateway", "profile": "default", "pid": 4242},
+        {"kind": "gateway", "profile": "coder", "pid": 4243},
+    ])
+    _patch_marker_sha(monkeypatch, sha)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kw: [{"profile": "coder", "pid": 99, "code_sha": "0" * 40,
+                       "code_version": "0.20.0", "state": "stale"}],
+    )
+
+    assert update_cmd_fleet._marker_only_restart_obsolete() is False
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_obligation_kept_for_unmapped_stopped_gateway_with_no_pid(monkeypatch, capsys):
+    """An identity-free row records an owed restart nothing can prove settled."""
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [{"kind": "gateway", "profile": None, "pid": 4242, "stopped_unmapped": True}])
+    _patch_marker_sha(monkeypatch, sha)
+    _patch_dead_pids(monkeypatch)
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_obligation_kept_when_inventory_row_has_no_recorded_pid(monkeypatch, capsys):
+    sha = "e" * 40
+    _dead_inventory_marker(sha, [{"kind": "gateway", "profile": "default"}])
+    _patch_marker_sha(monkeypatch, sha)
+    _patch_dead_pids(monkeypatch)
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+    assert update_cmd_fleet._fleet_restart_obligation_armed()

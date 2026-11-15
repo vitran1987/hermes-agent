@@ -330,6 +330,78 @@ def _marker_owed_gateways(inventory: object) -> set[tuple[str, str]] | None:
     return owed
 
 
+def _marker_owed_gateways_gone(inventory: object, owed: set[tuple[str, str]] | None,
+                               fleet: list) -> set[tuple[str, str]] | None:
+    """Owed identities whose every recorded runtime is provably gone; None when unclassifiable.
+
+    The obligation asks one thing: bring gateways that were serving pre-update code onto the pulled
+    code. A recorded gateway whose process is gone owes that restart to nobody — whatever starts for
+    that profile next loads the code on disk, so the debt settles itself. That is the rule the fleet
+    matrix already applies to dead PIDs: ``collect_fleet_versions`` documents that a stale state file
+    from a long-dead gateway must NOT fail every future update (``down`` requires
+    ``pre_restart_pids`` membership, i.e. a gateway the update itself killed) and its socket/state
+    fallback skips a PID that is not live.
+
+    Without this judge an inventory whose runtimes have since exited can never discharge:
+    ``collect_fleet_versions`` yields no row for a dead PID, so those identities can never enter
+    ``covered``, so the marker stays armed for the life of the install — and while armed every later
+    CLI launch re-enters the update fence (``_update_fenced`` → ``draining/update_paused``), refusing
+    worker spawns as a side effect of merely launching.
+
+    Pruning is per identity, so a live stale gateway keeps its restart while a dead sibling stops
+    blocking settlement.
+
+    ``None`` (fail closed — the caller keeps every identity) for anything that is not positive
+    evidence: an unreadable/malformed inventory, a ``stopped_unmapped`` or unidentified row, a row
+    without a recorded ``pid``, an inventory row set that does not match ``owed``, an unidentified
+    fleet row, or a liveness probe that raises. An identity covered by a live gateway (including a
+    multiplexer's ``served_profiles``) is never pruned: the ordinary matrix verdict judges it, and a
+    ``stale`` one still owes the restart.
+
+    Availability is not this judge's concern: a profile that should be running a gateway and is not
+    is reported by the lane supervisor and by ``update_inventory.report_unaccounted_runtimes`` at
+    update time. Holding this record open never started that gateway — it only fenced launches.
+    """
+    if owed is None or not owed:
+        return set()
+    if not isinstance(inventory, dict):
+        return None
+    runtimes = inventory.get("runtimes")
+    if not isinstance(runtimes, list):
+        return None
+    from hermes_cli.update_cmd_fleet_gatewayless import runtime_outside_gateway_evidence
+
+    recorded: dict[tuple[str, str], list[int]] = {}
+    for runtime in runtimes:
+        if not isinstance(runtime, dict) or runtime_outside_gateway_evidence(runtime):
+            continue
+        if runtime.get("kind") != "gateway" or runtime.get("stopped_unmapped"):
+            return None  # an identity-free row: no PID to probe
+        profile = runtime.get("profile")
+        if not isinstance(profile, str) or not profile.strip() or profile == "unknown":
+            return None
+        pid = runtime.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return None  # a pid-less row records an owed restart nobody can prove settled
+        recorded.setdefault(("gateway", profile), []).append(pid)
+    if set(recorded) != owed:
+        return None  # a row this reader cannot classify must not be dropped silently
+    from hermes_cli.update_receipt import row_is_external
+
+    covered = _fleet_covered_gateways([row for row in fleet if not row_is_external(row)])
+    if covered is None:
+        return None  # unidentified runtime: the matrix cannot vouch for anything
+    try:
+        from gateway.status import _pid_exists
+
+        gone = {identity for identity, pids in recorded.items()
+                if identity not in covered and not any(_pid_exists(pid) for pid in pids)}
+    except Exception as exc:
+        logger.debug("Could not establish recorded-gateway liveness; keeping the obligation: %s", exc)
+        return None
+    return gone
+
+
 def _discharge_gatewayless_marker(checkout_sha: str, expected_sha: str) -> bool:
     """Settle an inventory-less marker on a host with no live gateway (#118742).
 
@@ -377,6 +449,12 @@ def _marker_only_restart_obsolete() -> bool:
     Discharging here strands nobody: the same row is still accounted at update time by
     ``update_inventory.report_unaccounted_runtimes``, which prints it and records an owed restart when the restart
     phase never touched it — this marker only stops re-warning about it on every later startup.
+
+    An owed identity whose recorded runtime has exited is pruned the same way
+    (``_marker_owed_gateways_gone``): the fleet matrix yields no row for a dead PID, so such an
+    identity could never be covered and the obligation could never settle — while an armed
+    obligation makes every later CLI launch re-enter the update fence and refuse worker spawns.
+    Once every recorded gateway has exited the debt is empty and the marker clears.
     """
     from hermes_cli.update_cmd_fleet_checkout import checkout_contains
 
@@ -385,7 +463,8 @@ def _marker_only_restart_obsolete() -> bool:
         if fields is None:
             return False
         expected_sha = fields.get("expected_sha", "").strip()
-        owed = _marker_owed_gateways(json.loads(fields.get("inventory", "null")))
+        inventory = json.loads(fields.get("inventory", "null"))
+        owed = _marker_owed_gateways(inventory)
     except (OSError, UnicodeError, ValueError):
         return False
     if owed is not None and not owed:
@@ -425,6 +504,22 @@ def _marker_only_restart_obsolete() -> bool:
             continue
         if row.get("state") != "current" or str(row.get("code_sha")) != target_sha:
             return False  # stale / down / unknown-identity row still owes the restart
+    # A recorded gateway whose process is gone can never enter ``covered`` (``collect_fleet_versions``
+    # yields no row for a dead PID), so before this judge such an identity stayed owed for the life of
+    # the install — and while armed every later launch re-entered the update fence and refused worker
+    # spawns. Prune those identities — but only here, after the live fleet has PROVEN it runs the
+    # checkout: a dead gateway with nothing live (an update that killed it and nothing came back) must
+    # keep its warning, which is contract C3 (``test_owed_restart_names_its_gateways_so_a_dead_fleet_
+    # cannot_discharge_it``). Pruning per identity keeps a live stale gateway's restart owed.
+    gone = _marker_owed_gateways_gone(inventory, owed, fleet)
+    if owed and gone:
+        owed = owed - gone
+        logger.debug("Fleet-restart obligation pruned %d exited gateway identity(ies): %s",
+                     len(gone), sorted(gone))
+        if not owed:
+            _clear_fleet_restart_pending_marker()
+            logger.debug("Fleet-restart-pending marker discharged: every recorded gateway has exited")
+            return True
     if owed is not None and not owed - {_UNMAPPED_GATEWAY} <= covered:
         return False  # A gateway this marker owns is absent (down) or unidentifiable.
     if owed and _UNMAPPED_GATEWAY in owed and not (_fleet_covered_gateways(

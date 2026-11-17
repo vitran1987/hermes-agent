@@ -777,7 +777,9 @@ def detect_stale_running(
         "WHERE t.status = 'running'"
     ).fetchall()
 
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_owner_recovery import (
+        owner_reclaim_blocked, owner_reclaim_blocked_after_kill, owner_restart_holds_run,
+    )
     for row in rows:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -795,6 +797,27 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        # A claim is a LEASE, not a PID. No heartbeat has ever been written for this run
+        # (``hb_age is None``), so nothing here proves the attempt is progressing — or that it
+        # died. When the process that issued the claim (or the owner that admitted the run) is
+        # gone but an interpreter the run recorded is still running, this is a RESTARTED OWNER,
+        # not a dead attempt: hold the claim and let the worker report its own exit. Killing the
+        # live worker is what ran a card into ``execution unknown`` + ``crashed`` + auto-block on
+        # every owner restart (2026-11-17: 7 cards died in one second). The 1h heartbeat backstop
+        # above still reclaims a worker that stops making observable progress.
+        if hb_age is None and owner_restart_holds_run(conn, row, tid):
+            # Same fence the reclaim transaction applies: an owner that recovered and bound an
+            # interpreter after the first look keeps its claim through its own path.
+            if owner_reclaim_blocked_after_kill(conn, tid, signalled=False):
+                continue
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"] or "", now,
+                {"terminated": False, "termination_attempted": False,
+                 "host_local": True, "prev_pid": _kb._opt_int(pid)},
+                reason="owner_restart_worker_alive",
+            )
+            continue
 
         termination = _kb._terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
@@ -1300,8 +1323,18 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            # An attempt whose OWNER recorded ``worker_lost`` was ended by the owner, not by the
+            # card: identical fingerprints across a batch are then one infrastructure event (an
+            # owner restart / lost managed turn), never N misbehaving cards. Tripping
+            # ``is_systemic`` at 1 there is what auto-blocked 7 cards in the same second on
+            # 2026-11-17 20:54:20. The card still pays ONE failure against its own
+            # ``failure_limit``, so retries stay bounded and a genuinely broken card still blocks.
+            owner_lost = bool(dead.event_payload.get("worker_lost"))
+            is_systemic = (fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+                           and not owner_lost)
             extra = {"pid": pid, "claimer": claimer}
+            if owner_lost:
+                extra["owner_lost"] = True
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True

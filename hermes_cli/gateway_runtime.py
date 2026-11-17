@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import logging
 import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from gateway.runtime_contract import RuntimeState
@@ -18,6 +21,15 @@ if TYPE_CHECKING:
 # 32-core CI runner with dozens of sibling boots, where 30 s tipped every attaching client
 # of a parallel e2e shard into `starting: deadline`. A minute is still a verdict, not a hang.
 DEFAULT_ENSURE_TIMEOUT = 60.0
+# How long a home that reports ``starting`` may hold that verdict when THIS call started nothing
+# before its lock holder is reclaimed. ``starting`` is derived from the runtime lock, so a live PID
+# whose control plane is dead (2026-11-17: a gateway under a mismatched CPython ABI answered every
+# session upgrade with HTTP 500) reads as "starting" for as long as that PID lives. A boot that
+# another client started holds the SAME lock and answers nothing until it binds its control socket,
+# and on a CPU-starved host it outlives this grace, so the grace is never on its own enough to stop
+# a holder: the reclaim also requires no progress over a whole window
+# (``gateway_runtime_progress.HolderProgress``).
+DEFAULT_STALLED_START_GRACE_S = 20.0
 
 
 @dataclass(frozen=True)
@@ -412,7 +424,8 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
 
 
 def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = None,
-                           idle_exit: bool = False) -> GatewayDiscovery:
+                           idle_exit: bool = False,
+                           stalled_start_grace_s: float | None = None) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
 
     ``timeout`` None: :data:`DEFAULT_ENSURE_TIMEOUT`, extended while the pending start's owner keeps
@@ -430,6 +443,20 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     ``idle_exit``: an unmanaged daemon this call starts ends itself once idle (client entrypoints:
     chat, TUI, cron/kanban/ACP clients). A gateway that is ending that way reports ``draining``
     (``idle_exit``); this call waits for it to go and starts the replacement transparently.
+
+    A ``starting`` verdict that this call did not produce is not a promise that anything is coming
+    back. Past ``stalled_start_grace_s`` (:data:`DEFAULT_STALLED_START_GRACE_S`) the lock holder is
+    verified from its lock record and stopped, and the replacement is started here
+    (``hermes_cli.gateway_runtime_replace.replace_unresponsive_owner``): waiting out the deadline for
+    a daemon whose control plane is dead is what returned ``starting: deadline`` to nine crashing
+    cards on 2026-11-17. The grace is not by itself evidence, though — a boot in progress holds the
+    same lock and answers nothing until it binds its control socket, and a cold boot measures ~160 s
+    of wall time on a CPU-starved host — so the reclaim also requires *no progress* from the holder
+    (``hermes_cli.gateway_runtime_progress.HolderProgress``: a whole window without CPU, or a record
+    older than a whole boot budget whose CPU cannot be read). A holder that is still accruing CPU
+    restarts its grace instead of being stopped, so a slow boot survives a sibling client's grace. A
+    holder that cannot be verified is refused with a reason and a repair command, never killed on a
+    guess.
     """
     import time
     from hermes_cli.gateway_runtime_service import (
@@ -439,7 +466,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     from hermes_constants import get_default_hermes_root, get_process_hermes_home
 
     from hermes_cli.gateway_launchd_runtime import GatewayJob
-    from hermes_cli.gateway_runtime_progress import StartRunway
+    from hermes_cli.gateway_runtime_progress import (PROGRESSING, PROGRESS_WINDOW_S, STALLED,
+                                                     HolderProgress, StartRunway)
     runway = StartRunway(timeout, DEFAULT_ENSURE_TIMEOUT)
     deadline = runway.deadline
     home = _overlay_owner_home(Path(_canonical_home(profile_home)))
@@ -452,6 +480,18 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     # start the replacement this call owes the client.
     retiring = False
     replaced: set[Path] = set()
+    # A home that reports ``starting`` while THIS call started nothing is a leftover holder: the
+    # lock is held, the control socket never answers. Waiting out the deadline for it is how nine
+    # cards crashed with ``Gateway starting: deadline`` on 2026-11-17, so past a startup grace a
+    # holder that has made no progress is reclaimed (verified from its lock record) and the
+    # replacement started here. A boot another client started looks the same until it binds its
+    # control socket, so the grace alone never decides: ``holder_progress`` must also see no CPU.
+    stalled_since: dict[Path, float] = {}
+    reclaimed: set[Path] = set()
+    holder_progress = HolderProgress()
+    launched: set[Path] = set()  # homes/targets THIS call started or started awaiting
+    grace_s = (DEFAULT_STALLED_START_GRACE_S if stalled_start_grace_s is None
+               else max(float(stalled_start_grace_s), 0.0))
     delay = 0.025
     try:
         while True:
@@ -490,8 +530,47 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             if observed.state == "starting" and not retiring:
                 requested = True
                 waiting[home] = None
+                # ``starting`` from a holder this call did not launch is unproven: the lock is held,
+                # nothing answers the control socket. Wait the startup grace once; if it is still
+                # unproven after that, reclaim the holder (verified from its lock record) so the next
+                # pass finds the home absent and starts the replacement this call owes.
+                now = time.monotonic()
+                if child is None and home not in launched and home not in reclaimed:
+                    stalled_for = now - stalled_since.setdefault(home, now)
+                    if stalled_for >= grace_s:
+                        # Wall-clock grace alone cannot tell a boot IN PROGRESS from a wedged
+                        # daemon: a cold start measures ~160 s of wall time on a CPU-starved host
+                        # (gateway_runtime_progress), so a sibling client's grace would stop a live
+                        # boot and its waiting clients would still end at ``starting: deadline``.
+                        # Reclaim only on evidence — the holder's CPU stood still across a whole
+                        # window (a boot keeps accruing CPU; a wedged daemon accrues none), or its
+                        # record outlived a whole boot budget and its CPU cannot be read at all.
+                        # No verdict yet (a boot budget of record age, an open window) is not
+                        # evidence: keep waiting, paced by the sleep at the foot of the loop.
+                        progress = holder_progress.sample(home)
+                        if progress == PROGRESSING:
+                            stalled_since[home] = now  # still booting: restart its startup grace
+                        elif progress == STALLED:
+                            from hermes_cli import gateway_runtime_replace as replace
+                            reclaimed.add(home)
+                            refusal = replace.replace_unresponsive_owner(home, deadline=deadline)
+                            if refusal is not None:
+                                waiting.pop(home, None)
+                                return GatewayDiscovery(
+                                    "inaccessible", reason_code="owner_unresponsive",
+                                    detail=replace.UNRESPONSIVE_DETAIL.get(refusal, _REPLACE_FAILED_DETAIL))
+                            logger.warning(
+                                "Gateway reported 'starting' for %.0fs with no answer on the control "
+                                "socket, no start of this process's making and no CPU progress across "
+                                "%.0fs; the unresponsive lock holder was stopped, starting the "
+                                "replacement.", stalled_for, PROGRESS_WINDOW_S)
+                            waiting.pop(home, None)
+                            continue
+            elif home in stalled_since:
+                stalled_since.pop(home, None)
             if observed.state == "absent":
                 retiring = False
+                stalled_since.pop(home, None)  # a fresh absence restarts the stall clock
             reserved = _starting_multiplexer_root(home) if observed.state == "absent" and not requested else None
             # Every pass, not only before joining: a root reserves before it publishes a standalone
             # refusal, and its CPU (now sampled) must not stretch a doomed wait.
@@ -520,9 +599,11 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
                     waiting.update(dict.fromkeys([home] if observed.state == "starting" else []))
                     continue
                 if service is not None:
+                    launched.update({target, home})
                     start_existing_gateway_service(service, deadline=deadline)
                 else:
                     from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size
+                    launched.update({target, home})
                     child_home, child_offset = target, stdio_log_size(target)
                     child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
                 requested = True

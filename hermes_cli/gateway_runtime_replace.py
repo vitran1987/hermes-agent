@@ -139,3 +139,79 @@ def replace_incompatible_owner(home: Path, *, deadline: float) -> str | None:
     except (PermissionError, OSError):
         return "owner_did_not_exit" if not _wait_gone(pid, 0) else None
     return None if _wait_gone(pid, _FORCED_STOP_SECONDS) else "owner_did_not_exit"
+
+
+UNRESPONSIVE_DETAIL = {
+    "foreign_install": "another Hermes install's gateway holds this profile's lock; stop it there: "
+                       "hermes gateway stop",
+    "owner_unverified": "a gateway holds this profile's lock but could not be verified as this "
+                        "install's own; run: hermes gateway stop",
+    "owner_did_not_exit": "a gateway holding this profile's lock did not stop; run: hermes gateway stop",
+}
+
+
+def replace_unresponsive_owner(home: Path, *, deadline: float) -> str | None:
+    """Stop a gateway that HOLDS this home's runtime lock but publishes NO control endpoint.
+
+    Discovery calls such a home ``starting`` (the lock is held, the control socket does not answer)
+    and keeps calling it that until the lock holder exits. A holder that cannot answer ``identify``
+    at all is not starting — it is a daemon whose control plane is dead, and no amount of waiting
+    brings its endpoint back. On 2026-11-17 that was a gateway started under a mismatched CPython
+    ABI: alive, lock held, every control/WebSocket answer a 500, so every client of the profile
+    waited out its deadline and returned ``Gateway starting: deadline`` for 453 s while nine cards
+    crashed against it. Nothing reclaimed it because the only reclaim path
+    (:func:`replace_incompatible_owner`) refuses when ``identify`` cannot be pinned.
+
+    Verification therefore comes from the LOCK RECORD — pid, start time and home matched against a
+    live process — which is the same identity ``gateway stop`` uses. Refused unless every field
+    agrees, so this can never stop a foreign install's daemon or a reused PID. A planned-stop
+    marker is written first (the owner's own exit path: clean exit, ``stopped`` persisted, no
+    supervisor revival), then a graceful stop, then a start-time-guarded force kill.
+
+    None once the home has no verified lock holder left (the caller starts the replacement), else a
+    refusal code from :data:`UNRESPONSIVE_DETAIL`. Never starts anything.
+    """
+    from gateway.status import (_GATEWAY_KIND, _read_gateway_lock_record,
+                                get_process_start_time, start_time_fingerprints_match, terminate_pid)
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError, _private_lock
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        return "owner_did_not_exit"
+    lock = home / "gateway.lock"
+    try:
+        if os.name != "nt":
+            _private_lock(lock)  # same mode/owner validation discovery applies before trusting it
+        record = _read_gateway_lock_record(lock)
+    except (FileNotFoundError, DiscoveryError, OSError):
+        return None  # nothing this process may stop: no readable lock of ours
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    if type(pid) is not int or pid <= 1 or pid in {os.getpid(), os.getppid()}:
+        return None  # no usable holder: an unlocked home is the caller's to start
+    if not _within_install(home, _install_root()) or not _same(record.get("hermes_home"), home):
+        return "foreign_install"
+    from gateway.status import _pid_exists
+    if record.get("kind") != _GATEWAY_KIND or not _pid_exists(pid):
+        return None  # the holder is gone (pid reuse guard below covers a rebound pid)
+    recorded, current = record.get("start_time"), get_process_start_time(pid)
+    try:
+        if recorded is None or current is None or not start_time_fingerprints_match(recorded, current):
+            return None  # not this process any more: nothing to verify, nothing to stop
+    except (TypeError, ValueError):
+        return "owner_unverified"
+    _write_planned_stop(home, pid, recorded)
+    graceful = min(_GRACEFUL_STOP_SECONDS, max(deadline - time.monotonic() - _FORCED_STOP_SECONDS, 1.0))
+    try:
+        if os.name != "nt":
+            # Windows has no SIGTERM for an asyncio loop: the marker watcher IS its graceful stop.
+            terminate_pid(pid, expected_start_time=recorded)
+        if _wait_gone(pid, graceful):
+            return None
+        terminate_pid(pid, force=True, expected_start_time=recorded)
+    except ProcessLookupError:
+        return None
+    except (PermissionError, OSError):
+        return None if _wait_gone(pid, 0) else "owner_did_not_exit"
+    return None if _wait_gone(pid, _FORCED_STOP_SECONDS) else "owner_did_not_exit"
+

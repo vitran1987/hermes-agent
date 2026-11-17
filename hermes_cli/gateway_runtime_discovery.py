@@ -237,8 +237,24 @@ def missing_owner_state(home: Path) -> Literal["starting", "absent", "inaccessib
     try:
         if os.name != "nt":
             _private_lock(lock)
-        return "starting" if _is_gateway_runtime_lock_active_strict(lock) else "absent"
+        if not _is_gateway_runtime_lock_active_strict(lock):
+            return "absent"
     except FileNotFoundError:
         return "absent"
     except (OSError, RuntimeError, DiscoveryError):
         return "inaccessible"
+    # The lock IS held — but by whom? A reservation (a boot that has not published its PID yet)
+    # legitimately holds it with no record, and must keep reading as ``starting``. A record that
+    # NAMES a process which is no longer alive is different: the owner died, nothing can answer this
+    # home's control socket (this function is only reached when nothing did), and the inode is a
+    # leftover. Treating that as ``starting`` keeps a profile blocked for as long as the file
+    # survives — the shape of the 2026-11-17 waits. A LIVE holder stays ``starting`` and is
+    # reclaimed by ``ensure_gateway_runtime`` once its startup grace expires.
+    from gateway.status import _live_pid_from_record, _pid_from_record, _read_gateway_lock_record
+    try:
+        record = _read_gateway_lock_record(lock)
+    except (OSError, ValueError):
+        return "starting"  # unreadable record: cannot prove the holder is gone
+    if record is None or _pid_from_record(record) is None:
+        return "starting"  # an unpublished reservation, not a stale artifact
+    return "starting" if _live_pid_from_record(record) is not None else "absent"

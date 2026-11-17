@@ -41,8 +41,65 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
 # so the default stays tight for genuine wedges.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# A missed probe is a verdict about the HOST before it is a verdict about the loop. A machine whose
+# CPU and memory are saturated by something else can starve a healthy loop for tens of seconds. On
+# 2026-11-17 12:00 ICT that cost nine cards: 43,463/48,915 MB used (11% available) with a CI runner
+# at 204% CPU starved the developer-bangioi gateway, 3 x 10 s strikes killed it, and every worker it
+# served failed with it. These are the headroom floors under which a miss is read as starvation.
+DEFAULT_STARVATION_MEM_AVAILABLE_FRAC = 0.15
+DEFAULT_STARVATION_LOAD_PER_CORE = 0.9
+# Starvation buys deadline extensions, never immunity: past this ceiling the owner is unresponsive
+# beyond any plausible scheduling delay, and the watchdog must still make it replaceable.
+DEFAULT_LOOP_WATCHDOG_STARVATION_CEILING_S = 600.0
+_MAX_PROBE_BACKOFF = 8.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+
+
+def sample_host_pressure(
+    *, mem_available_floor: float = DEFAULT_STARVATION_MEM_AVAILABLE_FRAC,
+    load_per_core_ceiling: float = DEFAULT_STARVATION_LOAD_PER_CORE,
+) -> Dict[str, Any]:
+    """This host's scheduling headroom: ``{"saturated", "reasons", "cpu_load_per_core",
+    "mem_available_frac"}``.
+
+    Read from the out-of-loop watchdog thread, so it must never raise and must never block: a fact
+    psutil cannot report is *unknown headroom*, which is not evidence of pressure (the watchdog then
+    behaves exactly as before). ``load_per_core_ceiling`` is the 1-minute load average per core on
+    POSIX; Windows has no load average, so the whole-machine CPU percentage is used instead, and its
+    first call in a process returns 0.0 — an unknown, again not pressure.
+    """
+    verdict: Dict[str, Any] = {
+        "saturated": False, "reasons": [], "cpu_load_per_core": None, "mem_available_frac": None,
+    }
+    try:
+        import psutil
+    except Exception:  # no psutil: no opinion, and the old strike accounting stands
+        return verdict
+    try:
+        vm = psutil.virtual_memory()
+        if vm.total:
+            verdict["mem_available_frac"] = vm.available / vm.total
+    except Exception:
+        logger.debug("Host memory sample failed", exc_info=True)
+    try:
+        cores = os.cpu_count() or 1
+        getloadavg = getattr(psutil, "getloadavg", None)
+        load = getloadavg()[0] if getloadavg is not None else None
+        if load is None:  # Windows: no load average
+            percent = psutil.cpu_percent(interval=None)
+            load = (percent / 100.0 * cores) if percent else None
+        if load is not None:
+            verdict["cpu_load_per_core"] = float(load) / float(cores)
+    except Exception:
+        logger.debug("Host CPU sample failed", exc_info=True)
+    mem, cpu = verdict["mem_available_frac"], verdict["cpu_load_per_core"]
+    if mem is not None and mem < mem_available_floor:
+        verdict["reasons"].append(f"memory {1.0 - mem:.0%} used, {mem:.0%} available")
+    if cpu is not None and cpu >= load_per_core_ceiling:
+        verdict["reasons"].append(f"CPU load {cpu:.2f} per core")
+    verdict["saturated"] = bool(verdict["reasons"])
+    return verdict
 
 
 def _coerce_float(value: Any, default: float, floor: float = 0.0) -> float:
@@ -89,15 +146,40 @@ def start_loop_liveness_watchdog(
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    pressure_sampler: Optional[Callable[[], Dict[str, Any]]] = None,
+    starvation_ceiling_s: float = DEFAULT_LOOP_WATCHDOG_STARVATION_CEILING_S,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes. The caller
     (``GatewayRunner._start_loop_liveness_guards``) enforces the ``gateway.loop_watchdog: false``
-    opt-out."""
+    opt-out.
+
+    A missed probe under host saturation is starvation, not a wedge: the deadline is extended and the
+    miss is not counted, up to *starvation_ceiling_s*. A missed probe on a host with headroom is the
+    wedge the watchdog exists for, and exits exactly as before with the same message. *pressure_sampler*
+    (default :func:`sample_host_pressure`) is the headroom verdict; a sampler that raises is not
+    evidence of pressure.
+    """
     stop_event = threading.Event()
+    sampler = pressure_sampler or sample_host_pressure
+    ceiling_s = _coerce_float(starvation_ceiling_s, DEFAULT_LOOP_WATCHDOG_STARVATION_CEILING_S, floor=0.0)
+
+    def _host_pressure() -> Dict[str, Any]:
+        try:
+            verdict = sampler()
+        except Exception:
+            logger.debug("Host pressure sample failed", exc_info=True)
+            return {"saturated": False, "reasons": []}
+        return verdict if isinstance(verdict, dict) else {"saturated": False, "reasons": []}
 
     def _watchdog() -> None:
         strikes = 0
+        extensions = 0  # consecutive starved probes: drives the probe back-off
+        starved_since: Optional[float] = None  # start of the current starvation episode
+        ceiling_reported = False
         while not stop_event.wait(timeout=probe_interval):
+            # Under pressure the probe itself gets longer, so a loop that answers late is not read
+            # as a loop that never answered.
+            effective_timeout = probe_timeout * min(2.0 ** min(extensions, 3), _MAX_PROBE_BACKOFF)
             probe_event = threading.Event()
             try:
                 loop.call_soon_threadsafe(probe_event.set)
@@ -106,7 +188,7 @@ def start_loop_liveness_watchdog(
             except Exception:
                 logger.debug("Failed to schedule gateway loop liveness probe", exc_info=True)
                 return
-            deadline = time.monotonic() + probe_timeout
+            deadline = time.monotonic() + effective_timeout
             while not stop_event.is_set():  # poll so a stop() mid-wait is honoured within ~50ms
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or probe_event.wait(timeout=min(remaining, 0.05)):
@@ -114,10 +196,58 @@ def start_loop_liveness_watchdog(
             else:
                 return
             if probe_event.is_set():
+                if strikes or starved_since is not None:
+                    logger.info(
+                        "Gateway event loop answered a liveness probe again after %d strike(s)%s.",
+                        strikes,
+                        f" and {time.monotonic() - starved_since:.0f}s of host starvation"
+                        if starved_since is not None else "")
                 strikes = 0
+                extensions = 0
+                starved_since = None
                 continue
             if stop_event.is_set():  # re-checked before each irreversible step: a late stop() wins
                 return
+            pressure = _host_pressure()
+            saturated = bool(pressure.get("saturated"))
+            now = time.monotonic()
+            if not saturated:
+                if starved_since is not None:
+                    logger.warning(
+                        "Host saturation cleared after %.0fs; the missed probe is counted as a "
+                        "normal strike again.", now - starved_since)
+                starved_since, ceiling_reported, extensions = None, False, 0
+            elif starved_since is None and strikes >= 1:
+                # One sample is not proof of starvation (the sampler can catch CI's churn), so the
+                # first miss of a series is still counted. From the second consecutive miss on, with
+                # the host still saturated, the environmental fact is confirmed: this is a starvation
+                # episode, and the miss is extended rather than accumulated into a wedge verdict.
+                starved_since = now
+            starved_for = 0.0
+            if starved_since is not None:
+                starved_for = now - starved_since
+                if starved_for < ceiling_s:
+                    extensions = min(extensions + 1, 3)
+                    strikes = 0
+                    logger.warning(
+                        "Gateway event loop missed a %.1fs liveness probe while the host is "
+                        "saturated (%s): the loop is STARVED, not wedged — extending the probe "
+                        "deadline to %.1fs and not counting this miss (starved %.0fs of the %.0fs "
+                        "ceiling).",
+                        effective_timeout, ", ".join(pressure.get("reasons") or ["no headroom"]),
+                        probe_timeout * min(2.0 ** extensions, _MAX_PROBE_BACKOFF), starved_for,
+                        ceiling_s)
+                    continue
+                # The ceiling is the guarantee that starvation never becomes immunity: past it the
+                # owner is unresponsive beyond any plausible scheduling delay. The episode stays
+                # open (so every further miss keeps counting) and the misses now accumulate.
+                if not ceiling_reported:
+                    ceiling_reported = True
+                    logger.warning(
+                        "Host saturation has not cleared after %.0fs (ceiling %.0fs): the gateway is "
+                        "unresponsive beyond any plausible scheduling delay — treating the loop as "
+                        "wedged.", starved_for, ceiling_s)
+            extensions = min(extensions, 3) if saturated else 0
             strikes += 1
             if strikes < max_strikes:
                 continue
@@ -132,7 +262,8 @@ def start_loop_liveness_watchdog(
             # liveness death used to leave no stack anywhere (#120356, #91097).
             _write_watchdog_dump(
                 get_shutdown_watchdog_dump_path(), delay_s=probe_timeout * strikes,
-                snapshot={"strikes": strikes, "probe_interval_s": probe_interval},
+                snapshot={"strikes": strikes, "probe_interval_s": probe_interval,
+                          "host_pressure": pressure, "starved_s": starved_for},
                 event="loop_liveness_watchdog_fired")
             if stop_event.is_set():
                 return

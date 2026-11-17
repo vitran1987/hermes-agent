@@ -295,3 +295,49 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     result, bound = latest('worker_result'), latest('worker_bound')
     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
     return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None
+
+
+def claim_issuer_gone(claim_lock) -> bool:
+    """True when the pid embedded in a host-local ``claim_lock`` is gone.
+
+    A claim lock is ``<host>:<pid>`` of the process that ISSUED the claim — the dispatcher
+    running inside a gateway. Restarting that gateway issues new claims under a new pid, so
+    every in-flight lock names a dead process while the worker it spawned is still running.
+    Only same-host locks are judged: another host's pid says nothing here, and a lock we
+    cannot parse is never proof of death.
+    """
+    lock = str(claim_lock or '')
+    host, sep, pid_text = lock.rpartition(':')
+    if not sep or not pid_text.isdigit():
+        return False
+    from hermes_cli import kanban_db as kb
+    try:
+        if host != kb._claimer_id().split(':', 1)[0]:
+            return False
+    except Exception:
+        return False
+    from hermes_cli.kanban_db_dispatch import _pid_alive
+    return not _pid_alive(int(pid_text))
+
+
+def owner_restart_holds_run(conn, task_row, task_id) -> bool:
+    """True when this run's original owner is gone while an interpreter it recorded still lives.
+
+    Distinguishes "a restarted owner left this card running" from "the attempt is dead": the
+    claim's issuer (``claim_lock``) or the owner that admitted the run is gone, and at least
+    one pid recorded for the run (``tasks.worker_pid``, ``spawned``, ``worker_bound``) is still
+    alive. In that shape the claim is a live lease, not a licence to kill the worker; only a
+    worker whose own process is gone may be reaped.
+    """
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+    receipt = _owner_receipt(conn, task_id)
+    owner_gone = claim_issuer_gone(task_row['claim_lock'] if task_row['claim_lock'] is not None else '')
+    if not owner_gone and receipt is not None:
+        owner_gone = _owner_process_gone(receipt)
+    if not owner_gone:
+        return False
+    try:
+        pids = _run_worker_pids(conn, task_row, task_id)
+    except (KeyError, IndexError):
+        return False
+    return any(_worker_alive(pid, fingerprint) for pid, fingerprint in pids)

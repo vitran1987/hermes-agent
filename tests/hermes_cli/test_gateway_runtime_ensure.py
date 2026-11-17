@@ -304,19 +304,71 @@ def test_native_windows_discovery_uses_same_user_pipe(tmp_path):
 
 
 @pytest.mark.platforms("windows")
-def test_native_windows_spawn_never_retries_without_breakaway(tmp_path, monkeypatch):
+def test_native_windows_spawn_retries_without_breakaway_when_the_job_refuses(tmp_path, monkeypatch):
+    """A parent job object that forbids breakaway must not fail the launch: the second attempt
+    drops CREATE_BREAKAWAY_FROM_JOB and keeps the rest of the detach bundle (acceptance 1)."""
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli._subprocess_compat import (
+        _WINDOWS_GATEWAY_BREAKAWAY_ENV, windows_detach_flags, windows_detach_flags_without_breakaway)
+    calls = []
+    child = object()
+
+    def spawn(argv, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # What CreateProcessW raises inside a job object without JOB_OBJECT_LIMIT_BREAKAWAY_OK.
+            raise PermissionError("job forbids breakaway")
+        return child
+
+    monkeypatch.setattr(start.subprocess, "Popen", spawn)
+    assert start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5) is child
+    assert [call["creationflags"] for call in calls] == [
+        windows_detach_flags(), windows_detach_flags_without_breakaway()]
+    assert calls[0]["env"][_WINDOWS_GATEWAY_BREAKAWAY_ENV] == "1"
+    assert calls[1]["env"][_WINDOWS_GATEWAY_BREAKAWAY_ENV] == "0"
+    # Only the job escape is dropped: hidden console + no Ctrl+C propagation survive the retry.
+    assert calls[1]["creationflags"] & 0x08000000 and calls[1]["creationflags"] & 0x00000200
+
+
+@pytest.mark.platforms("windows")
+def test_native_windows_spawn_reports_spawn_failed_without_retrying_an_unrelated_oserror(
+        tmp_path, monkeypatch):
+    """Acceptance 2: a missing interpreter or a bad cwd is not a breakaway refusal — one attempt,
+    and the original classification survives instead of being relabelled as breakaway."""
     from hermes_cli import gateway_runtime_start as start
     from hermes_cli.gateway_runtime_service import RuntimeStartError
-    from hermes_cli._subprocess_compat import windows_detach_flags
     calls = []
-    def denied(argv, **kwargs):
+    failure = FileNotFoundError(2, "The system cannot find the file specified")
+    failure.winerror = 2  # ERROR_FILE_NOT_FOUND, not ERROR_ACCESS_DENIED
+
+    def spawn(argv, **kwargs):
         calls.append(kwargs)
-        raise PermissionError("job forbids breakaway")
-    monkeypatch.setattr(start.subprocess, "Popen", denied)
-    with pytest.raises(RuntimeStartError, match="windows_breakaway_unavailable"):
-        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic()+5)
+        raise failure
+
+    monkeypatch.setattr(start.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeStartError, match="spawn_failed") as raised:
+        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5)
+    assert raised.value.__cause__ is failure
     assert len(calls) == 1
-    assert calls[0]["creationflags"] == windows_detach_flags()
+
+
+@pytest.mark.platforms("windows")
+def test_native_windows_spawn_keeps_the_breakaway_verdict_when_the_retry_also_fails(
+        tmp_path, monkeypatch):
+    """Acceptance 3: the runbooks and the worker's error surface key on this string, so two failed
+    attempts must still end in ``windows_breakaway_unavailable``."""
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    calls = []
+
+    def spawn(argv, **kwargs):
+        calls.append(kwargs)
+        raise PermissionError("access is denied")
+
+    monkeypatch.setattr(start.subprocess, "Popen", spawn)
+    with pytest.raises(RuntimeStartError, match="windows_breakaway_unavailable"):
+        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5)
+    assert len(calls) == 2
 
 
 @pytest.mark.platforms("macos")

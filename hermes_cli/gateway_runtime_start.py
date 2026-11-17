@@ -6,7 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_GATEWAY_BREAKAWAY_ENV
+from hermes_cli._subprocess_compat import (
+    windows_detach_flags_without_breakaway, windows_detach_popen_kwargs, _WINDOWS_GATEWAY_BREAKAWAY_ENV)
 from hermes_cli.gateway_launchd_runtime import GatewayJob, start_gateway_job
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 
@@ -40,9 +41,23 @@ DAEMON_STRIPPED_ENV = (
 )
 
 
+def is_breakaway_denial(exc: OSError) -> bool:
+    """True only when Win32 refused THIS spawn because the parent's job forbids breakaway.
+
+    ``CreateProcessW`` answers that case with ``ERROR_ACCESS_DENIED``, which Python raises as
+    ``PermissionError``. Nothing else may take the no-breakaway retry: a missing interpreter
+    (``FileNotFoundError``), a bad cwd (``NotADirectoryError``) or a sharing violation (winerror 32)
+    is a real failure the second attempt would reproduce — retrying it only doubles the cost and
+    reports a breakaway verdict for something that is not a breakaway refusal.
+    """
+    if sys.platform != "win32":
+        return False
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5
+
+
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
                             force: bool = False) -> subprocess.Popen | GatewayJob:
-    """Request a daemon, not readiness. Refuse Windows no-breakaway fallback.
+    """Request a daemon, not readiness. A refused Windows breakaway is retried without it.
 
     No --replace, persistence, login changes, elevation, shell, or inherited stdio.
     The gateway runtime's own exclusive ownership fence arbitrates racing starts.
@@ -86,16 +101,41 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
         if job := start_gateway_job(command, env=env, cwd=root, log_path=logs / "gateway-stdio.log",
                                     deadline=deadline):
             return job
-    try:
+    def _spawn(*, breakaway: bool) -> subprocess.Popen:
+        """One spawn attempt. ``breakaway=False`` drops ONLY the job-object escape."""
+        kwargs = windows_detach_popen_kwargs()
+        child_env = env
+        if not breakaway:
+            # Windows-only: POSIX detaches with start_new_session, which no job object can refuse.
+            kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+            # Private spawn metadata `gateway run` reads for its exit diagnostics: the child must
+            # report that it is job-bound, exactly like gateway_windows._spawn_detached does.
+            child_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}
         with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
             remaining(deadline)
-            return subprocess.Popen(command, cwd=root, env=env, close_fds=True,
+            return subprocess.Popen(command, cwd=root, env=child_env, close_fds=True,
                                     stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                     # detached-spawn: ok — a gateway daemon launch must outlive its launcher
-                                    **windows_detach_popen_kwargs())
+                                    **kwargs)
+
+    try:
+        return _spawn(breakaway=True)
     except OSError as exc:
-        reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
-        raise RuntimeStartError(reason) from exc
+        if not is_breakaway_denial(exc):
+            # Not a breakaway refusal: the retry would fail identically, so keep the real verdict.
+            raise RuntimeStartError("spawn_failed") from exc
+        # The parent sits in a Win32 job object that forbids CREATE_BREAKAWAY_FROM_JOB (Hermes
+        # Desktop/Electron and the Tauri installer wrap their children in one). Retry once without
+        # it: the child keeps CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP, so it still owns a
+        # hidden console (no descendant console-flash, #54220/#56747) and Ctrl+C still does not
+        # propagate — only the job escape is dropped. It therefore inherits that job and dies when
+        # the parent's job is torn down; that is the trade-off the core's own
+        # `windows_detach_flags` docstring already chose for this case, and strictly better than
+        # never spawning the daemon at all.
+        try:
+            return _spawn(breakaway=False)
+        except OSError as retry_exc:
+            raise RuntimeStartError("windows_breakaway_unavailable") from retry_exc
 
 
 def start_detached_replacement(profile_home: Path, *, force: bool = False) -> int:

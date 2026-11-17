@@ -8,7 +8,7 @@ it has served nobody and has nothing to do for ``gateway.unmanaged_idle_exit_sec
 
 - no attached client (live ticketed WebSocket, outstanding ticket, or recent HTTP/WS activity);
 - no messaging adapter configured, connected or reconnecting (any profile);
-- no runnable cron job and no kanban task the dispatcher must act on;
+- no runnable cron job and no kanban task the dispatcher must act on for a profile it serves;
 - no queued/started admission, live managed worker, in-flight agent/cron/API run, background
   process or async delegation, active heartbeat/loop, pending handoff or hosted-room task.
 
@@ -108,17 +108,73 @@ def _cron_busy(homes) -> str | None:
     return None
 
 
-def _kanban_busy() -> str | None:
+def _served_profile_names(homes) -> frozenset[str]:
+    """The profile ids behind ``homes`` — the only kanban assignees that can hold this gateway up.
+
+    A home that is not a profile home (a throwaway home a script, a test or a one-shot
+    ``chat -q`` started) names no profile: no card is attributable to it, so it holds nothing.
+    """
+    from hermes_cli.profiles import normalize_profile_name
+    from hermes_constants import profile_name_for_home
+    names = set()
+    for home in homes:
+        name = profile_name_for_home(home)
+        if not name:
+            continue
+        try:
+            names.add(normalize_profile_name(name))
+        except ValueError:
+            continue
+    return frozenset(names)
+
+
+def _own_claim_lock() -> str:
+    """This process's kanban claim lock (``<host>:<pid>``, see ``kanban_db._claimer_id``)."""
+    from hermes_cli.kanban_db import _claimer_id
+    return _claimer_id()
+
+
+def _kanban_busy(homes) -> str | None:
+    """A due kanban card *this* gateway answers for, or ``None``.
+
+    Scoped per owner, not per board. A board-global probe made one due card anywhere hold every
+    ``--idle-exit`` gateway on the host, so no unmanaged daemon could ever retire while the board was
+    busy for somebody else. A card holds this gateway when either
+
+    - it is assigned to a profile this gateway serves (:func:`_served_homes`) — the work its
+      dispatcher, ledger and adapters act on; or
+    - this process's own dispatcher already claimed it (``claim_lock`` is ``<host>:<pid>``), whatever
+      the assignee: the spawn is ours, so retiring now would strand it.
+
+    A card for an unserved profile, and a card no profile can own (unassigned, or a label like a
+    tier name the dispatcher parks as non-spawnable), holds nothing — the gateway that would act on
+    it is a different one.
+    """
     from hermes_cli import kanban_db
+    from hermes_cli.profiles import normalize_profile_name
+    served = _served_profile_names(homes)
+    try:
+        own_lock = _own_claim_lock()
+    except Exception:
+        own_lock = ""
     marks = ",".join("?" * len(_KANBAN_DUE_STATUSES))
     for meta in kanban_db.list_boards(include_archived=False):
-        path = kanban_db.kanban_db_path(board=meta.get("slug"))
+        slug = meta.get("slug")
+        path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             continue
         with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as conn:
-            if conn.execute(f"SELECT 1 FROM tasks WHERE status IN ({marks}) LIMIT 1",
-                            _KANBAN_DUE_STATUSES).fetchone():
-                return f"kanban work on board {meta.get('slug')}"
+            for assignee, claim_lock in conn.execute(
+                    f"SELECT assignee, claim_lock FROM tasks WHERE status IN ({marks})",
+                    _KANBAN_DUE_STATUSES):
+                if own_lock and claim_lock == own_lock:
+                    return f"kanban work this gateway claimed on board {slug}"
+                try:
+                    canonical = normalize_profile_name(assignee)
+                except ValueError:
+                    continue
+                if canonical in served:
+                    return f"kanban work for {canonical} on board {slug}"
     return None
 
 
@@ -196,7 +252,7 @@ def busy_reason(runner, *, window: float, count_clients: bool = True) -> str | N
             return "background work in flight"
         homes = _served_homes(runner)
         return (_messaging_busy(runner) or _ledger_busy(runner) or _profile_start_busy(runner)
-                or _cron_busy(homes) or _kanban_busy() or _store_gates_busy(homes))
+                or _cron_busy(homes) or _kanban_busy(homes) or _store_gates_busy(homes))
     except Exception as exc:
         logger.debug("idle-exit probe failed; staying up", exc_info=True)
         return f"idle probe failed ({type(exc).__name__})"

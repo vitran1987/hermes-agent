@@ -41,7 +41,7 @@ def _runner(tmp_path, monkeypatch, *, work):
     monkeypatch.setattr(run_idle_exit, "idle_exit_seconds", lambda r: 600.0)
     for probe in ("_ledger_busy", "_cron_busy", "_store_gates_busy"):
         monkeypatch.setattr(run_idle_exit, probe, lambda *_a: None)
-    monkeypatch.setattr(run_idle_exit, "_kanban_busy", lambda: None)
+    monkeypatch.setattr(run_idle_exit, "_kanban_busy", lambda homes: None)
     monkeypatch.setattr(run_idle_exit, "_served_homes", lambda r: [home])
     monkeypatch.setattr(environments_adopt, "_restart_pending", None)
     return runner, stops

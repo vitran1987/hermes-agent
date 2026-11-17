@@ -200,21 +200,28 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [
-    gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
-    GUE("Gateway starting: deadline", "starting", "deadline"),
-    GUE("Gateway inaccessible: invalid_control_peer", "inaccessible", "invalid_control_peer"),
-    gateway_client.GatewayRPCError("runtime_draining"),
+@pytest.mark.parametrize("fault, budget", [
+    (gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
+     kanban_worker_client.OWNER_WAIT_S),
+    # A restart in progress is not a dead owner: the revival budget has to cover the measured
+    # 453 s downtime, so `starting` ends at OWNER_REVIVAL_WAIT_S rather than OWNER_WAIT_S.
+    (GUE("Gateway starting: deadline", "starting", "deadline"),
+     kanban_worker_client.OWNER_REVIVAL_WAIT_S),
+    (GUE("Gateway inaccessible: invalid_control_peer", "inaccessible", "invalid_control_peer"),
+     kanban_worker_client.OWNER_WAIT_S),
+    (gateway_client.GatewayRPCError("runtime_draining"), kanban_worker_client.OWNER_WAIT_S),
 ], ids=["refused", "starting", "control-reset", "draining"])
-async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock, fault):
-    # Every restart shape still ends at OWNER_WAIT_S when it never clears.
+async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock, fault,
+                                                                    budget):
+    # Every restart shape still ends at its budget when it never clears: the silence budget, or the
+    # revival budget when the owner says it is coming back.
     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
+    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for \d+s: {fault}"):
         await _run(owner, monkeypatch, _worker_env)
-    assert clock.now >= kanban_worker_client.OWNER_WAIT_S
+    assert budget <= clock.now < budget + 120
     # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
-    assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
+    assert 3 < owner.dials < budget / 4 and owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio

@@ -1,14 +1,18 @@
 """One detached-process primitive; callers must first prove owner/service absence."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
 
+from hermes_cli._gateway_interpreter import GatewayInterpreterError, resolve_gateway_interpreter
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_GATEWAY_BREAKAWAY_ENV
 from hermes_cli.gateway_launchd_runtime import GatewayJob, start_gateway_job
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
+
+logger = logging.getLogger(__name__)
 
 
 # One launch's policy and pins, never the shared daemon's: hook consent would become daemon-lifetime
@@ -57,7 +61,17 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     # _apply_profile_override follows the sticky active_profile and boots the wrong
     # profile's daemon. A <root>/profiles/<name> home is already trusted as-is.
     selector = [] if home.parent.name == "profiles" else ["--profile", "default"]
-    command = [sys.executable, "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
+    # The daemon loads the committed environment's site-packages, and a compiled extension is
+    # ABI-tagged: the CALLER's interpreter cannot be trusted (a 3.11 client handed a 3.14 tree
+    # boots, answers /.well-known/agent.json, then refuses every session WebSocket with HTTP 500
+    # -- incident 2026-11-17 12:00). Resolve the environment's own interpreter; a verified
+    # mismatch that no candidate satisfies raises instead of starting a zombie owner.
+    try:
+        python = resolve_gateway_interpreter(root)
+    except GatewayInterpreterError as exc:
+        logger.error("Refusing to start the gateway daemon: %s", exc)
+        raise RuntimeStartError("gateway_interpreter_incompatible", detail=str(exc)) from exc
+    command = [str(python), "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
                *(["--idle-exit"] if idle_exit else []), *(["--force"] if force else [])]
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).

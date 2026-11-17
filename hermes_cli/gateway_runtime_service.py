@@ -22,9 +22,16 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 
 class RuntimeStartError(RuntimeError):
-    def __init__(self, reason: str, state: RuntimeState = "inaccessible"):
-        super().__init__(reason)
-        self.reason, self.state = reason, state
+    """A start request was refused; *reason* is the stable code callers key on.
+
+    *detail* carries the human-readable cause (which interpreter, which module)
+    for the cases where the code alone cannot be acted on -- it rides the
+    message, never the token, so ``reason_code`` comparisons stay stable.
+    """
+
+    def __init__(self, reason: str, state: RuntimeState = "inaccessible", detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.state, self.detail = reason, state, detail
 
 
 def remaining(deadline: float) -> float:

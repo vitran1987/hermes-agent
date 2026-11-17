@@ -22,6 +22,14 @@ from typing import Optional
 # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
 # gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
 OWNER_WAIT_S = 180.0
+# ... EXCEPT while the owner says it is coming back: ``starting``/``draining`` is a restart in
+# progress, not a failure, and a restart can legitimately outlast the silence budget. On 2026-11-17
+# developer-bangioi's owner was dead for 453 s (12:00:38 watchdog exit -> 12:08:11 new owner) against
+# this 180 s budget, so every worker gave up 186-248 s in, ~3 minutes before a replacement existed,
+# and each exit was booked as a card crash. The revival budget must cover the worst measured owner
+# downtime with a margin: a waiting worker is cheap, a card that spends its failure budget on the
+# host's outage is not.
+OWNER_REVIVAL_WAIT_S = 900.0
 _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
 # retired authority's successor holds the admission the next connection reads.
@@ -48,12 +56,28 @@ def admission_answer_budget():
 @dataclass
 class _Claim:
     """What the owner has said about this attempt, carried across connections."""
+
     answered: float  # monotonic time of the owner's last answer
     session_id: Optional[str] = None
     admission_id: Optional[str] = None
+    revival_noted: bool = False  # the "waiting for a replacement" line was printed
 
     def silent_for(self):
         return time.monotonic() - self.answered
+
+
+def _note_owner_revival(exc, claim):
+    """Say once, on stderr, that this worker is waiting out the owner's restart.
+
+    Without it the only trace of a long wait is the eventual failure line, which reads like a
+    worker fault — the 2026-11-17 incident was diagnosed from crash payloads that could not tell
+    the two apart.
+    """
+    if claim.revival_noted or _owner_budget(exc) <= OWNER_WAIT_S:
+        return
+    claim.revival_noted = True
+    print(f'Kanban owner restarting ({exc}); waiting up to {_owner_budget(exc):.0f}s for the '
+          'replacement to answer (the worker is not at fault)', file=sys.stderr, flush=True)
 
 
 async def run(params, board_db):
@@ -89,7 +113,8 @@ async def run(params, board_db):
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
             if not _restartable(exc):
                 raise
-            if claim.silent_for() >= OWNER_WAIT_S:
+            _note_owner_revival(exc, claim)
+            if claim.silent_for() >= _owner_budget(exc):
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
@@ -111,6 +136,19 @@ def _restartable(exc):
     if isinstance(exc, GatewayUnavailableError):
         return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
     return True
+
+
+def _owner_budget(exc):
+    """Seconds this worker may stay silent before giving up on the owner.
+
+    A ``starting``/``draining`` owner is a restart in progress: someone is bringing a replacement
+    up, so the worker waits the revival budget instead of the silence budget. Every other
+    restartable failure keeps ``OWNER_WAIT_S``.
+    """
+    from hermes_cli.gateway_client import GatewayUnavailableError
+    if isinstance(exc, GatewayUnavailableError) and exc.state in _TRANSIENT_OWNER_STATES:
+        return OWNER_REVIVAL_WAIT_S
+    return OWNER_WAIT_S
 
 
 async def _discard(events):

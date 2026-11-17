@@ -231,14 +231,33 @@ def _private_lock(lock: Path) -> None:
 
 
 def missing_owner_state(home: Path) -> Literal["starting", "absent", "inaccessible"]:
-    """A reservation before PID/control publication already excludes a new owner."""
+    """A reservation before PID/control publication already excludes a new owner.
+
+    A lock that is HELD by a record naming a process which is no longer alive is not a start in
+    progress: that owner died and the inode is a leftover, so the caller must start a replacement
+    rather than wait out its startup deadline. On 2026-11-17 a supervisor kept the lock of a
+    watchdog-killed gateway, this function read ``starting`` for as long as the file survived
+    (453 s measured), and every Kanban worker of that profile spent its silence budget and failed
+    the card (``Kanban owner silent for 191s: Gateway starting: deadline``). An UNPUBLISHED
+    reservation (no record yet, a boot that has not written its PID) still reads ``starting``, so
+    no owner is ever raced.
+    """
     from gateway.status import _is_gateway_runtime_lock_active_strict
     lock = home / "gateway.lock"
     try:
         if os.name != "nt":
             _private_lock(lock)
-        return "starting" if _is_gateway_runtime_lock_active_strict(lock) else "absent"
+        if not _is_gateway_runtime_lock_active_strict(lock):
+            return "absent"
     except FileNotFoundError:
         return "absent"
     except (OSError, RuntimeError, DiscoveryError):
         return "inaccessible"
+    from gateway.status import _live_pid_from_record, _pid_from_record, _read_gateway_lock_record
+    try:
+        record = _read_gateway_lock_record(lock)
+    except (OSError, ValueError):
+        return "starting"  # an unreadable record cannot prove the holder is gone
+    if record is None or _pid_from_record(record) is None:
+        return "starting"  # an unpublished reservation, not a stale artifact
+    return "starting" if _live_pid_from_record(record) is not None else "absent"

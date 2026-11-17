@@ -7,17 +7,21 @@ upgrade with HTTP 500), waited out its whole deadline and returned ``Gateway sta
 Nine cards crashed with that reason; nothing ever reclaimed the holder, because the only reclaim
 path (``replace_incompatible_owner``) refuses when ``identify`` cannot be pinned.
 
-These tests pin the three decisions that fix it:
+These tests pin the decisions that fix it:
 
   * a lock record naming a DEAD process is a leftover, not a start in progress;
   * a holder that reports ``starting`` without being launched by this call is reclaimed after the
-    startup grace, verified from its lock record, and the replacement is started here;
+    startup grace + a whole window of no CPU progress, verified from its lock record, and the
+    replacement is started here;
+  * a holder that is still BOOTING (its CPU keeps growing) is slow, not hung: never reclaimed, even
+    past the grace, however long the boot takes on a CPU-starved host (PR #18 review);
   * a start THIS call launched is never reclaimed, and an unverifiable holder is refused with a
     repair command instead of being killed on a guess.
 """
 
 from __future__ import annotations
 
+import time
 import types
 
 import pytest
@@ -82,17 +86,38 @@ def fast_runway(monkeypatch):
     return gateway_runtime
 
 
+def _holder(monkeypatch, *, pid: int = 4242, cpu=lambda elapsed: 2.0) -> None:
+    """The lock holder as the progress sampler sees it: *pid*, and its CPU seconds at *elapsed*.
+
+    ``cpu`` flat is a WEDGED holder (alive, no progress); growing is a boot in progress.
+    """
+    from hermes_cli import gateway_runtime_progress as progress
+    t0 = time.monotonic()
+    monkeypatch.setattr(progress, "_starting_owner_pid", lambda homes, child: pid)
+    monkeypatch.setattr(progress, "_cpu_seconds", lambda sampled: cpu(time.monotonic() - t0))
+
+
+def _aged_lock(home, *, age_s: float) -> None:
+    """A lock record whose holder published it ``age_s`` seconds ago."""
+    import os
+    home.mkdir(parents=True, exist_ok=True)
+    lock = home / "gateway.lock"
+    lock.write_text('{"pid": 4242, "kind": "gateway"}', encoding="utf-8")
+    when = time.time() - age_s
+    os.utime(lock, (when, when))
+
+
 def _past_deadline(deadline: float) -> None:
     """The real observer raises ``TimeoutError`` once its budget is spent; a fake must too, or the
     ensure loop spins on a deadline nothing is checking."""
-    import time as _time
-    if _time.monotonic() >= deadline:
+    if time.monotonic() >= deadline:
         raise TimeoutError
 
 
 def test_a_stalled_starting_holder_is_reclaimed_and_the_client_is_served(fast_runway, tmp_path, monkeypatch):
     from hermes_cli import gateway_runtime_replace as replace
 
+    _holder(monkeypatch)  # alive, holding the lock, accruing no CPU: the 2026-11-17 ABI-500 daemon
     state = {"reclaimed": False}
     reclaimed: list = []
 
@@ -114,9 +139,58 @@ def test_a_stalled_starting_holder_is_reclaimed_and_the_client_is_served(fast_ru
     assert len(reclaimed) == 1, "the unresponsive holder must be reclaimed exactly once"
 
 
+def test_a_holder_that_keeps_booting_is_never_reclaimed_even_past_the_grace(fast_runway, tmp_path, monkeypatch):
+    """PR #18: a sibling client's grace stopped an owner that was alive and still booting.
+
+    A boot publishes its lock record at ``run_bootstrap`` and only then binds the control socket, so
+    a legal foreign client sees ``starting`` for as long as the boot takes — ~160 s of wall time on
+    a CPU-starved host, against a 20 s grace. The reclaim must wait for that boot: the same CPU
+    evidence that keeps a start of this call's own alive (:class:`StartRunway`) protects it.
+    """
+    from hermes_cli import gateway_runtime_replace as replace
+
+    booted_after = 3.0
+    _holder(monkeypatch, cpu=lambda elapsed: 5.0 * elapsed)  # booting: CPU grows, no socket yet
+    killed: list = []
+    t0 = time.monotonic()
+
+    def observe(home, deadline, replaced):
+        _past_deadline(deadline)
+        if time.monotonic() - t0 >= booted_after:
+            return gateway_runtime.GatewayDiscovery("ready")
+        return gateway_runtime.GatewayDiscovery("starting")
+
+    monkeypatch.setattr(gateway_runtime, "_observe_replacing_stale", observe)
+    monkeypatch.setattr(replace, "replace_unresponsive_owner",
+                        lambda home, *, deadline: killed.append(home) or "owner_unverified")
+
+    result = gateway_runtime.ensure_gateway_runtime(tmp_path, stalled_start_grace_s=0.5)
+
+    assert killed == [], "a foreign owner that is still booting must never be stopped"
+    assert result.state == "ready", "the boot must be awaited, not killed, and then served"
+
+
+def test_a_reservation_that_published_nothing_is_never_reclaimed(fast_runway, tmp_path, monkeypatch):
+    """No record and no pid: a boot too young to judge. Waiting is the only safe verdict."""
+    from hermes_cli import gateway_runtime_replace as replace
+
+    killed: list = []
+    monkeypatch.setattr(gateway_runtime, "_observe_replacing_stale",
+                        lambda home, deadline, replaced: (_past_deadline(deadline),
+                                                          gateway_runtime.GatewayDiscovery("starting"))[1])
+    monkeypatch.setattr(replace, "replace_unresponsive_owner",
+                        lambda home, *, deadline: killed.append(home))
+
+    result = gateway_runtime.ensure_gateway_runtime(tmp_path, stalled_start_grace_s=0.0)
+
+    assert killed == []
+    assert (result.state, result.reason_code) == ("starting", "deadline")
+
+
 def test_a_holder_that_cannot_be_verified_is_refused_with_a_repair_command(fast_runway, tmp_path, monkeypatch):
     from hermes_cli import gateway_runtime_replace as replace
 
+    _aged_lock(tmp_path, age_s=600.0)  # a record older than any boot, and no CPU this call can read
     monkeypatch.setattr(gateway_runtime, "_observe_replacing_stale",
                         lambda home, deadline, replaced: gateway_runtime.GatewayDiscovery("starting"))
     monkeypatch.setattr(replace, "replace_unresponsive_owner",
@@ -127,6 +201,7 @@ def test_a_holder_that_cannot_be_verified_is_refused_with_a_repair_command(fast_
     assert (result.state, result.reason_code) == ("inaccessible", "owner_unresponsive")
     assert "hermes gateway stop" in (result.detail or "")
     assert "verified" in (result.detail or "")
+
 
 
 def test_a_start_this_call_launched_is_never_reclaimed(fast_runway, tmp_path, monkeypatch):

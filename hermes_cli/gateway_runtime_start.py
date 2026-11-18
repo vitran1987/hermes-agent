@@ -60,7 +60,11 @@ def _breakaway_denied(exc: OSError, detach_kwargs: dict) -> bool:
     """
     if "creationflags" not in detach_kwargs:  # POSIX start_new_session: no flag to be refused
         return False
-    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == _ERROR_ACCESS_DENIED
+    # Exactly CreateProcessW's answer to a job that forbids breakaway -- not "any PermissionError
+    # while a creationflags bundle is present". Opening the stdio log, an AV/backup holding the
+    # image (winerror 32) and a missing interpreter (2) are OSError too; only 5 means the job
+    # objected, so only 5 may spend the second attempt and relabel the cause.
+    return getattr(exc, "winerror", None) == _ERROR_ACCESS_DENIED
 
 
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
@@ -111,39 +115,47 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
             return job
     # detached-spawn: ok — a gateway daemon launch must outlive its launcher
     detach_kwargs = windows_detach_popen_kwargs()
+    # The stdio log is opened OUTSIDE anything classified as a breakaway refusal. A log that will
+    # not open -- a directory in its place, an AV/backup programme holding it (winerror 32) -- is
+    # the launch failing on its own terms: reporting it as `windows_breakaway_unavailable` after
+    # zero CreateProcessW calls would pollute the very string this taxonomy exists to de-noise.
     try:
-        with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
+        output = (logs / "gateway-stdio.log").open("ab", buffering=0)
+    except OSError as exc:
+        raise RuntimeStartError("spawn_failed") from exc
+    with output:
+        try:
             remaining(deadline)
             return subprocess.Popen(command, cwd=root, env=env, close_fds=True,
                                     stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                     **detach_kwargs)
-    except OSError as exc:
-        # Only a job object refusing breakaway earns a second attempt. Every other OSError -- a
-        # missing interpreter, a bad cwd, an unreadable binary -- is the spawn failing on its own
-        # terms and keeps its own taxonomy instead of being retried into the same error.
-        if not _breakaway_denied(exc, detach_kwargs):
-            raise RuntimeStartError("spawn_failed") from exc
-    # The parent's job forbids breakaway: Hermes Desktop's Electron/Tauri job object is the one that
-    # does. Refusing to spawn there is what surfaced as 258 `Gateway inaccessible:
-    # windows_breakaway_unavailable` worker crashes in three days (2026-11-14..17) -- every
-    # on-demand start a Desktop-launched process asked for failed outright. Retry once without
-    # CREATE_BREAKAWAY_FROM_JOB, the fallback windows_detach_flags() already documents for exactly
-    # this case. CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP stay, so the child still owns a
-    # hidden console (the #54220/#56747 console-flash history stays closed) and Ctrl+C still does
-    # not propagate; only the job escape is dropped. The child then inherits the parent's job and
-    # dies when that job is torn down -- strictly better than no daemon at all, and the breakaway
-    # stamp drops to "0" so the daemon's exit diagnostics report an inherited job instead of
-    # claiming an escape that never happened (_windows_gateway_breakaway_state).
-    fallback_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}
-    try:
-        with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
+        except OSError as exc:
+            # Only a job object refusing breakaway earns a second attempt. Every other OSError -- a
+            # missing interpreter, a bad cwd, an unreadable binary -- is the spawn failing on its
+            # own terms and keeps its own taxonomy instead of being retried into the same error.
+            if not _breakaway_denied(exc, detach_kwargs):
+                raise RuntimeStartError("spawn_failed") from exc
+        # The parent's job forbids breakaway: Hermes Desktop's Electron/Tauri job object is the one
+        # that does. Refusing to spawn there is what surfaced as 258 `Gateway inaccessible:
+        # windows_breakaway_unavailable` worker crashes in three days (2026-11-14..17) -- every
+        # on-demand start a Desktop-launched process asked for failed outright. Retry once without
+        # CREATE_BREAKAWAY_FROM_JOB, the fallback windows_detach_flags() already documents for
+        # exactly this case. CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP stay, so the child still
+        # owns a hidden console (the #54220/#56747 console-flash history stays closed) and Ctrl+C
+        # still does not propagate; only the job escape is dropped. The child then inherits the
+        # parent's job and dies when that job is torn down -- strictly better than no daemon at
+        # all, and the breakaway stamp drops to "0" so the daemon's exit diagnostics report an
+        # inherited job instead of claiming an escape that never happened
+        # (_windows_gateway_breakaway_state).
+        fallback_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}
+        try:
             remaining(deadline)
             return subprocess.Popen(command, cwd=root, env=fallback_env, close_fds=True,
                                     stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                     creationflags=windows_detach_flags_without_breakaway())
-    except OSError as exc:
-        reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
-        raise RuntimeStartError(reason) from exc
+        except OSError as exc:
+            reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
+            raise RuntimeStartError(reason) from exc
 
 
 def start_detached_replacement(profile_home: Path, *, force: bool = False) -> int:

@@ -389,6 +389,68 @@ def test_native_windows_spawn_both_attempts_denied_keeps_the_taxonomy(tmp_path, 
     assert calls[1]["creationflags"] == windows_detach_flags_without_breakaway()
 
 
+@pytest.mark.platforms("windows")
+def test_native_windows_unopenable_stdio_log_is_not_a_breakaway_refusal(tmp_path, monkeypatch):
+    """A log we cannot open is NOT a job object refusing breakaway.
+
+    ``logs/gateway-stdio.log`` as a directory (or held by an AV/backup programme) raises
+    PermissionError from the log open, before any CreateProcessW call. Classified as a breakaway
+    refusal it would report `windows_breakaway_unavailable` with ZERO spawn attempts -- the very
+    runbook string this fix exists to de-noise -- and spend a pointless retry. Injected, never a
+    real job object.
+    """
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli import gateway_windows
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    monkeypatch.setattr(gateway_windows, "windowless_gateway_restart_spec",
+                        lambda command: (command, None, {"RUNTIME_TEST_OVERLAY": "1"}))
+    home = tmp_path.resolve()
+    (home / "logs" / "gateway-stdio.log").mkdir(parents=True)  # a directory where the log goes
+    calls = []
+
+    def instrumented(argv, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError("no spawn may be attempted when the stdio log cannot be opened")
+
+    monkeypatch.setattr(start.subprocess, "Popen", instrumented)
+    with pytest.raises(RuntimeStartError) as raised:
+        start.spawn_unmanaged_gateway(home, deadline=time.monotonic() + 5)
+    assert raised.value.reason == "spawn_failed"
+    assert isinstance(raised.value.__cause__, OSError)
+    assert len(calls) == 0  # CreateProcessW was never reached
+
+
+@pytest.mark.platforms("windows")
+def test_native_windows_sharing_violation_is_not_a_breakaway_refusal(tmp_path, monkeypatch):
+    """winerror 32 (an AV/backup holding the image) is not ERROR_ACCESS_DENIED.
+
+    Only winerror 5 is CreateProcessW's answer to a job that forbids breakaway. Any other
+    PermissionError keeps its own classification and is not retried.
+    """
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli import gateway_windows
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    from hermes_cli.gateway_runtime_start import _breakaway_denied
+    from hermes_cli._subprocess_compat import windows_detach_flags
+    monkeypatch.setattr(gateway_windows, "windowless_gateway_restart_spec",
+                        lambda command: (command, None, {"RUNTIME_TEST_OVERLAY": "1"}))
+    sharing_violation = PermissionError(13, "The process cannot access the file", None, 32)
+    assert _breakaway_denied(sharing_violation,
+                             {"creationflags": windows_detach_flags()}) is False
+    calls = []
+
+    def held_by_av(argv, **kwargs):
+        calls.append(kwargs)
+        raise sharing_violation
+
+    monkeypatch.setattr(start.subprocess, "Popen", held_by_av)
+    with pytest.raises(RuntimeStartError) as raised:
+        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5)
+    assert raised.value.reason == "spawn_failed"
+    assert raised.value.__cause__ is sharing_violation
+    assert len(calls) == 1  # no second attempt: it would fail the same way
+
+
 @pytest.mark.platforms("macos")
 def test_native_launchd_ambiguous_domains_cannot_start(tmp_path, monkeypatch):
     from hermes_cli.gateway_runtime_service import discover_existing_gateway_service, RuntimeStartError

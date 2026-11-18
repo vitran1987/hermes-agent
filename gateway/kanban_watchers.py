@@ -27,6 +27,7 @@ from gateway.kanban_watchers_common import (
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
+    _kbd,
     _log_spawn_results,
     _resolve_dispatcher_settings,
 )
@@ -35,6 +36,10 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# A guard/cap-held tick is reported at INFO, this rarely: the hold is normal
+# operation and repeating it every `_HEALTH_WINDOW` ticks is the noise this
+# constant exists to prevent. The genuinely-stuck WARNING keeps its own 300s.
+_HOLD_LOG_INTERVAL_SECONDS = 900.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -276,9 +281,21 @@ class GatewayKanbanWatchersMixin:
         # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
         # is non-empty but spawns are 0 for N consecutive ticks — usually a
         # broken PATH, missing venv, or credential loss.
+        #
+        # A zero-spawn tick that a spawn guard, the per-profile cap, the host
+        # concurrency cap or memory pressure explains is NOT that condition: the
+        # dispatcher deliberately deferred the work and picks it up when the
+        # hold clears. Those ticks are counted apart (`held_ticks`) and reported
+        # once per `_HOLD_LOG_INTERVAL_SECONDS` at INFO; only an unexplained
+        # zero-spawn keeps `bad_ticks` and the WARNING (t_6a107755 — a board
+        # correctly throttled by its own guards used to log "stuck" hundreds of
+        # times a day, pointing every investigation at the wrong subsystem).
         bad_ticks = 0
+        held_ticks = 0
         last_warn_at = 0
+        last_hold_log_at = 0
         results: Optional[list] = None
+        hold_reason: Optional[str] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
@@ -286,8 +303,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
-                from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
+                pids = await _to_thread_process_service(_kbd().reap_worker_zombies)
                 if pids:
                     logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
             except Exception:
@@ -298,6 +314,8 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    held_ticks = 0
+                    hold_reason = None
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -308,10 +326,22 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    zero_spawn_pending = bool(ready_pending and not any_spawned)
+                    # None => nothing explains the zero spawn: a real fault.
+                    hold_reason = (
+                        _kbd().classify_hold(
+                            (res for _slug, res in (results or [])),
+                            per_profile_cap=getattr(
+                                settings, "max_in_progress_per_profile", None
+                            ),
+                        )
+                        if zero_spawn_pending else None
+                    )
+                    bad_ticks = bad_ticks + 1 if zero_spawn_pending and hold_reason is None else 0
+                    held_ticks = held_ticks + 1 if zero_spawn_pending and hold_reason else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
+                    held = _kbd().describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
                         "%d consecutive ticks but 0 workers spawned.%s Check "
@@ -320,6 +350,17 @@ class GatewayKanbanWatchersMixin:
                         bad_ticks, f" Last tick held back: {held}." if held else "",
                     )
                     last_warn_at = now
+                elif hold_reason and held_ticks >= _HEALTH_WINDOW and now - last_hold_log_at >= _HOLD_LOG_INTERVAL_SECONDS:
+                    logger.info(
+                        "kanban dispatcher idle: ready queue non-empty for %d "
+                        "consecutive ticks but every spawnable task was "
+                        "deliberately deferred (%s). Not a fault — nothing is "
+                        "spawnable until the hold clears%s.",
+                        held_ticks, hold_reason or "hold not described",
+                        f" (max_in_progress_per_profile={settings.max_in_progress_per_profile})"
+                        if settings.max_in_progress_per_profile else "",
+                    )
+                    last_hold_log_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

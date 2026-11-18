@@ -149,20 +149,55 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    tick_suppressed: Optional[str] = None
+    """Host-wide concurrency cap that made this tick spawn nothing:
+    ``"max_spawn"`` (board already at ``kanban.max_spawn``) or
+    ``"max_in_progress"`` (host already at ``kanban.max_in_progress``).
+
+    A deliberate throttle, not a fault: the tick returns before enumerating
+    any row, so ``ready_considered`` stays 0. Health telemetry reports it apart
+    from a zero-spawn tick that nothing can explain."""
+    ready_considered: int = 0
+    """Spawnable ready/review rows this tick actually evaluated.
+
+    Counted so telemetry can subtract the outcome buckets (``spawned`` plus the
+    deliberate-skip lists) from the rows the dispatcher looked at. A remainder
+    of 0 alongside a hold bucket means every ready card was deferred on
+    purpose; a remainder above 0 means the dispatcher could not spawn work it
+    had no reason to hold back — the only case that is genuinely "stuck"
+    (t_6a107755)."""
+    spawn_errors: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` spawns the host refused this tick — workspace
+    resolution or ``spawn_fn`` raised.
+
+    A genuine fault, never a deliberate hold: it names the failure in the health
+    line (``spawn_error=1 (t_x: RuntimeError: ...)``) and keeps a tick that also
+    carries a cap/guard hold classified as stuck, so a broken profile can never
+    hide behind a busy one."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    ``active_pr=1, recent_success=2, rate_limited=1, per_profile_capped=2,
+    profile_at_cap=developer-bangioi(running=3), skipped_locked=1,
+    memory_pressure=critical`` — the respawn-guard reasons counted per task,
+    the per-assignee concurrency cap counted per deferred task plus the
+    profiles it held back, and the tick-level holds. Feeds the "dispatcher
+    stuck" warnings of the CLI daemon and the embedded gateway dispatcher,
+    which otherwise report a bare zero-spawn count while ``hermes kanban tail``
+    is the only place the guard reason is written (#111910).
+
+    ``skipped_per_profile_capped`` is collected by the lane loop and used to be
+    dropped here, so a tick that deferred every ready card on the per-profile
+    cap logged as an unexplainable zero-spawn (t_6a107755).
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    tick_suppressed: Optional[str] = None
+    capped_tasks: dict[str, int] = {}  # assignee -> tasks deferred at the cap
+    capped_running: dict[str, int] = {}  # assignee -> running count when deferred
+    spawn_errors: list[tuple[str, str]] = []
     for res in results:
         if res is None:
             continue
@@ -170,14 +205,99 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        for _task_id, assignee, running in res.skipped_per_profile_capped:
+            capped_tasks[assignee] = capped_tasks.get(assignee, 0) + 1
+            capped_running[assignee] = max(capped_running.get(assignee, 0), int(running))
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.tick_suppressed:
+            tick_suppressed = res.tick_suppressed
+        spawn_errors.extend(getattr(res, "spawn_errors", ()))
+    if capped_tasks:
+        counts["per_profile_capped"] = sum(capped_tasks.values())
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if capped_tasks:
+        parts.append(
+            "profile_at_cap="
+            + ",".join(
+                f"{name}(running={capped_running[name]})" for name in sorted(capped_tasks)
+            )
+        )
+    if tick_suppressed:
+        parts.append(f"tick_capped={tick_suppressed}")
+    if spawn_errors:
+        # A spawn the host refused is a FAULT, not a hold: name it here so the
+        # "dispatcher stuck" warning carries the reason instead of a bare count.
+        task_id, reason = sorted(spawn_errors)[0]
+        parts.append(f"spawn_error={len(spawn_errors)} ({task_id}: {reason[:120]})")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def classify_hold(
+    results: Iterable[Optional[DispatchResult]],
+    *,
+    per_profile_cap: Optional[int] = None,
+) -> Optional[str]:
+    """Explain a zero-spawn tick when every spawnable row was deliberately deferred.
+
+    Returns a one-line reason — the guard counts, or the profiles sitting at
+    ``kanban.max_in_progress_per_profile`` with their running count and the
+    configured cap — only when BOTH hold:
+
+    * at least one hold bucket fired (respawn guard, rate limit, per-profile
+      cap, host concurrency cap, memory pressure, dispatch lock), and
+    * no evaluated row went unaccounted for: ``ready_considered`` minus the
+      outcome buckets is 0, i.e. the dispatcher did not leave ready work behind
+      that it had no reason to hold back.
+
+    ``None`` means "nothing explains the zero spawn" and the caller must keep
+    its loud warning. A spawn that FAILED is not a hold: the row is neither in
+    ``spawned`` nor in a skip list, so the remainder is above 0 and the warning
+    stays loud on purpose.
+
+    ``per_profile_cap`` is the configured ``kanban.max_in_progress_per_profile``
+    (the cap value is not carried on ``DispatchResult``); it only feeds the
+    human-readable reason.
+    """
+    rows = [res for res in results if res is not None]
+    if not rows:
+        return None
+    if sum(len(res.spawned) for res in rows):
+        return None  # something spawned — not a zero-spawn tick
+    if any(getattr(res, "spawn_errors", ()) for res in rows):
+        # A spawn the host refused is the clearest possible fault. Even if a
+        # cap or guard also fired this tick, a broken profile must never be
+        # reported as a deliberate hold.
+        return None
+    tick_hold = next((res.tick_suppressed for res in rows if res.tick_suppressed), None)
+    pressure = next((res.memory_pressure for res in rows if res.memory_pressure), None)
+    locked = any(res.skipped_locked for res in rows)
+    held = (
+        sum(len(res.respawn_guarded) for res in rows)
+        + sum(len(res.rate_limited) for res in rows)
+        + sum(len(res.skipped_per_profile_capped) for res in rows)
+    )
+    if not (tick_hold or pressure or locked or held):
+        return None
+    # A tick-level hold returns before any row is enumerated, so the row
+    # arithmetic below only applies when rows were actually evaluated.
+    if not (tick_hold or pressure or locked):
+        considered = sum(res.ready_considered for res in rows)
+        explained = (
+            held
+            + sum(len(res.skipped_nonspawnable) for res in rows)
+            + sum(len(res.skipped_unassigned) for res in rows)
+        )
+        if considered <= 0 or considered != explained:
+            return None  # ready work left behind with no hold to explain it
+    reason = describe_suppression(rows)
+    if per_profile_cap is not None and any(res.skipped_per_profile_capped for res in rows):
+        reason += f", max_in_progress_per_profile={per_profile_cap}"
+    return reason
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2133,6 +2253,7 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        result.spawn_errors.append((claimed.id, f"workspace: {type(exc).__name__}: {exc}"))
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2165,6 +2286,9 @@ def _dispatch_lane_task(
         # The host refused the spawn (no restart-safe scope): nothing about the
         # card ran, so it must not spend the card's retry budget (#114720).
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        result.spawn_errors.append(
+            (claimed.id, f"{type(exc).__name__}: {exc}")
+        )
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
@@ -2259,12 +2383,16 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Deliberate board-level throttle: say so, or health telemetry sees
+            # a zero-spawn tick with no explanation (t_6a107755).
+            result.tick_suppressed = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.tick_suppressed = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2427,6 +2555,9 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        # Rows this tick actually decided on — health telemetry subtracts the
+        # outcome buckets from this to tell a deliberate hold from a fault.
+        result.ready_considered += 1
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -2448,6 +2579,7 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        result.ready_considered += 1
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

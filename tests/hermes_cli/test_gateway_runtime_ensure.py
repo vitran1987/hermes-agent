@@ -306,19 +306,87 @@ def test_native_windows_discovery_uses_same_user_pipe(tmp_path):
 
 
 @pytest.mark.platforms("windows")
-def test_native_windows_spawn_never_retries_without_breakaway(tmp_path, monkeypatch):
+def test_native_windows_spawn_retries_when_the_job_forbids_breakaway(tmp_path, monkeypatch):
+    """A parent job object that refuses CREATE_BREAKAWAY_FROM_JOB must not lose the daemon.
+
+    Hermes Desktop's Electron/Tauri job forbids breakaway; the first attempt therefore raises
+    PermissionError (ERROR_ACCESS_DENIED) and the spawn retries once without the flag. Driven by
+    an injected error, never by a real job object: the host's own job policy is not the subject.
+    """
     from hermes_cli import gateway_runtime_start as start
-    from hermes_cli.gateway_runtime_service import RuntimeStartError
-    from hermes_cli._subprocess_compat import windows_detach_flags
+    from hermes_cli import gateway_windows
+    from hermes_cli._subprocess_compat import (windows_detach_flags,
+                                               windows_detach_flags_without_breakaway,
+                                               _WINDOWS_GATEWAY_BREAKAWAY_ENV)
+    from types import SimpleNamespace
+    monkeypatch.setattr(gateway_windows, "windowless_gateway_restart_spec",
+                        lambda command: (command, None, {"RUNTIME_TEST_OVERLAY": "1"}))
+    child = SimpleNamespace(pid=4321)
     calls = []
+
+    def denied_then_spawned(argv, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise PermissionError(5, "Access is denied", None, 5)  # job refuses breakaway
+        return child
+
+    monkeypatch.setattr(start.subprocess, "Popen", denied_then_spawned)
+    assert start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5) is child
+    assert len(calls) == 2
+    assert calls[0]["creationflags"] == windows_detach_flags()
+    assert calls[1]["creationflags"] == windows_detach_flags_without_breakaway()
+    # Only the job escape is dropped: hidden console + own process group stay, and the child is
+    # told it did NOT escape the job so its exit diagnostics report the truth.
+    assert calls[1]["creationflags"] & windows_detach_flags()
+    assert calls[1]["env"][_WINDOWS_GATEWAY_BREAKAWAY_ENV] == "0"
+
+
+@pytest.mark.platforms("windows")
+def test_native_windows_spawn_unrelated_oserror_is_not_retried(tmp_path, monkeypatch):
+    """A missing interpreter or a bad cwd is not a breakaway refusal: no retry, and the cause
+    keeps its own classification instead of being relabelled windows_breakaway_unavailable."""
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli import gateway_windows
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    monkeypatch.setattr(gateway_windows, "windowless_gateway_restart_spec",
+                        lambda command: (command, None, {"RUNTIME_TEST_OVERLAY": "1"}))
+    calls = []
+
+    def missing_interpreter(argv, **kwargs):
+        calls.append(kwargs)
+        raise FileNotFoundError(2, "The system cannot find the file specified", argv[0])
+
+    monkeypatch.setattr(start.subprocess, "Popen", missing_interpreter)
+    with pytest.raises(RuntimeStartError) as raised:
+        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5)
+    assert raised.value.reason == "spawn_failed"
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+    assert len(calls) == 1
+
+
+@pytest.mark.platforms("windows")
+def test_native_windows_spawn_both_attempts_denied_keeps_the_taxonomy(tmp_path, monkeypatch):
+    """windows_breakaway_unavailable stays reachable: other code and the runbooks key on it."""
+    from hermes_cli import gateway_runtime_start as start
+    from hermes_cli import gateway_windows
+    from hermes_cli.gateway_runtime_service import RuntimeStartError
+    from hermes_cli._subprocess_compat import windows_detach_flags, windows_detach_flags_without_breakaway
+    monkeypatch.setattr(gateway_windows, "windowless_gateway_restart_spec",
+                        lambda command: (command, None, {"RUNTIME_TEST_OVERLAY": "1"}))
+    calls = []
+
     def denied(argv, **kwargs):
         calls.append(kwargs)
-        raise PermissionError("job forbids breakaway")
+        raise PermissionError(5, "Access is denied", None, 5)
+
     monkeypatch.setattr(start.subprocess, "Popen", denied)
-    with pytest.raises(RuntimeStartError, match="windows_breakaway_unavailable"):
-        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic()+5)
-    assert len(calls) == 1
+    with pytest.raises(RuntimeStartError) as raised:
+        start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5)
+    assert raised.value.reason == "windows_breakaway_unavailable"
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert len(calls) == 2
     assert calls[0]["creationflags"] == windows_detach_flags()
+    assert calls[1]["creationflags"] == windows_detach_flags_without_breakaway()
 
 
 @pytest.mark.platforms("macos")

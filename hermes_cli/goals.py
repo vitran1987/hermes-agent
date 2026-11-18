@@ -536,6 +536,23 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
     done.set()
 
 
+def session_db_is_warm() -> bool:
+    """True when the current profile's goals SessionDB is already in the cache.
+
+    ``_get_session_db`` is safe to call on the loop only when it hits this cache: a miss kicks a
+    bootstrap and waits a bounded grace window (a loop stall). Callers that only want the warm
+    guarantee (the gateway's loop watcher) check this first and skip the off-loop hop entirely once
+    startup has warmed it, so no executor submit — and no ``Thread.start()`` — happens per tick.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        cached = _DB_CACHE.get(str(get_hermes_home()))
+    except Exception:
+        return False
+    return cached is not None and not _registry_tore_down(cached)
+
+
 def _get_session_db() -> Optional[Any]:
     """Cached SessionDB per HERMES_HOME (profile switches pick the right DB); None on any failure.
 

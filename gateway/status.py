@@ -244,9 +244,38 @@ def _get_process_hermes_home() -> Path:
     return get_process_hermes_home()
 
 
+# Resolved homes, keyed by the path string handed in. ``Path.resolve`` is a synchronous filesystem
+# walk (``ntpath.realpath`` on Windows) and ``_build_pid_record`` runs on the gateway event loop for
+# every runtime-status publish (adapter heartbeats, api_server's heartbeat loop, the profile
+# reconciler). 24 of the 42 measured watchdog dumps had the loop blocked in exactly that realpath.
+# A process only ever resolves a handful of homes (its own plus the served profiles), and the answer
+# cannot change for a directory that already exists.
+_CANONICAL_HOME_CACHE: dict[str, Path] = {}
+_CANONICAL_HOME_CACHE_MAX = 64
+
+
 def _canonical_hermes_home(path: Path | str) -> Path:
-    """Stable absolute HERMES_HOME path for persisted identity data."""
-    return Path(path).expanduser().resolve(strict=False)
+    """Stable absolute HERMES_HOME path for persisted identity data.
+
+    Memoised per input path: ``resolve`` is a filesystem call and this sits under every runtime
+    status publish, which runs on the event loop. A path that does not exist yet is resolved but
+    not remembered — it may become a symlinked component once it is created.
+    """
+    raw = os.fspath(path)
+    cached = _CANONICAL_HOME_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    resolved = Path(raw).expanduser().resolve(strict=False)
+    if len(_CANONICAL_HOME_CACHE) < _CANONICAL_HOME_CACHE_MAX:
+        with contextlib.suppress(OSError):
+            if resolved.exists():
+                _CANONICAL_HOME_CACHE[raw] = resolved
+    return resolved
+
+
+def forget_canonical_home_cache() -> None:
+    """Forget resolved homes (tests that move a home directory on disk)."""
+    _CANONICAL_HOME_CACHE.clear()
 
 
 def _same_hermes_home(left: Path | str, right: Path | str) -> bool:
@@ -786,14 +815,35 @@ def _record_argv() -> list[str]:
     return argv
 
 
+_PID_RECORD_CACHE: dict[str, dict] = {}
+
+
 def _build_pid_record() -> dict:
-    return {
-        "pid": os.getpid(), "kind": _GATEWAY_KIND, "argv": _record_argv(),
-        "start_time": _get_process_start_time(os.getpid()),
+    """This process's identity for ``gateway.pid`` / ``gateway_state.json``.
+
+    Every runtime-status publish stamps these fields, and the publish path runs on the gateway
+    event loop (adapter heartbeats, api_server's heartbeat loop, profile reconcilers). Resolving the
+    home is a ``realpath`` walk and the argv rewrite imports ``hermes_cli.main``, so those are
+    computed once per home and reused: neither changes while the process runs. ``start_time`` is
+    re-read per call (it is a cheap syscall and tests patch it per case). Keyed by the raw home
+    string so a caller that switches ``HERMES_HOME`` (multiplex profile scopes) gets its own record.
+    """
+    home = _get_process_hermes_home()
+    key = os.fspath(home)
+    cached = _PID_RECORD_CACHE.get(key)
+    if cached is None:
         # Scoped locks are machine-global; the owner's home lets a cross-profile
         # --replace place its takeover marker where the target will read it.
-        "hermes_home": str(_canonical_hermes_home(_get_process_hermes_home())),
-    }
+        cached = {"kind": _GATEWAY_KIND, "argv": _record_argv(),
+                  "hermes_home": str(_canonical_hermes_home(home))}
+        if len(_PID_RECORD_CACHE) < _CANONICAL_HOME_CACHE_MAX:
+            _PID_RECORD_CACHE[key] = cached
+    return {"pid": os.getpid(), **cached, "start_time": _get_process_start_time(os.getpid())}
+
+
+def forget_pid_record_cache() -> None:
+    """Forget cached process identity records (tests that move a home or version on disk)."""
+    _PID_RECORD_CACHE.clear()
 
 
 def _get_code_identity_fields() -> dict[str, Any]:
@@ -1200,6 +1250,39 @@ def publish_runtime_status(**fields: Any) -> int:
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Read ``gateway_state.json``; ``path`` lets callers inspect another profile's file."""
     return _read_json_file(path or _get_runtime_status_path())
+
+
+async def read_runtime_status_async(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """``read_runtime_status`` for async callers: the read runs off the event loop.
+
+    The read opens and parses a file. On the loop it is a synchronously blocking filesystem call —
+    measured in the gateway watchdog dumps (``_read_json_file`` inside the profile reconciler and
+    the api_server health handler). Async callers use this instead; the payload is unchanged.
+    """
+    return await asyncio.to_thread(read_runtime_status, path)
+
+
+async def publish_runtime_status_async(**fields: Any) -> int:
+    """``publish_runtime_status`` for async callers: prepare + enqueue run off the event loop.
+
+    ``publish_runtime_status`` merges the payload, stamps the pid record and emits the transition —
+    cheap after the identity caches warm up, but it still touches the filesystem on a first call and
+    the caller is the loop. Heartbeat loops use this form so no part of a status publish can ever
+    block the loop that the liveness watchdog probes.
+    """
+    return await asyncio.to_thread(lambda: publish_runtime_status(**fields))
+
+
+def warm_runtime_status_publishing() -> None:
+    """Resolve the one-time, filesystem-touching parts of a status publish.
+
+    Run this from a startup worker thread: it builds the pid record (``realpath`` + argv rewrite),
+    resolves the code identity (first call walks git) and starts the writer thread. Afterwards the
+    publishers the adapters and watchers run on the loop only merge memory and queue a snapshot.
+    """
+    _build_pid_record()
+    _get_code_identity_fields()
+    _get_runtime_status_writer()
 
 
 # Max age of a ``gateway_state.json`` snapshot before its liveness claim is suspect: an older record

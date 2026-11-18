@@ -221,10 +221,31 @@ def build_gateway_health_snapshot(
     return GatewayHealthSnapshot(metrics=metrics, events=events)
 
 
+_PROFILE_CACHE: dict[str, str] = {}
+
+
 def _safe_profile() -> str:
+    """Profile label for status-change events, without a ``realpath`` per emit.
+
+    ``get_active_profile_name`` resolves the home, the default root and the profiles root on every
+    call, and this runs on the gateway event loop for every runtime-status publish (the adapter and
+    api_server heartbeats). 8 of the 42 measured watchdog dumps had the loop in that ``realpath``.
+    The name is a pure function of the home path, so it is memoised per home string: a multiplexed
+    turn that binds another profile asks a different key and gets that profile's name. A misbehaving
+    home still degrades to "default", exactly as before.
+    """
     try:
         from hermes_cli.profiles import get_active_profile_name
-        return str(get_active_profile_name() or "default")
+        from hermes_constants import get_hermes_home
+
+        key = str(get_hermes_home())
+        cached = _PROFILE_CACHE.get(key)
+        if cached is not None:
+            return cached
+        name = str(get_active_profile_name() or "default")
+        if len(_PROFILE_CACHE) < 64:
+            _PROFILE_CACHE[key] = name
+        return name
     except Exception:
         return "default"
 
@@ -291,10 +312,33 @@ def _platform_events(
     return out
 
 
+def _has_transition(previous: Optional[dict[str, Any]], current: dict[str, Any]) -> bool:
+    """True when the publish changed the gateway state or any platform's state.
+
+    Most publishes (heartbeat re-stamps of ``updated_at``/metrics) change neither, and the emit
+    path below it resolves the profile and version — filesystem work that must not run on the
+    gateway event loop for nothing.
+    """
+    old_state = _optional_state((previous or {}).get("gateway_state"), allowed=_KNOWN_GATEWAY_STATES)
+    new_state = _optional_state(current.get("gateway_state"), allowed=_KNOWN_GATEWAY_STATES)
+    if new_state and old_state != new_state:
+        return True
+    old_platforms = _platforms_of(previous)
+    for platform, pdata in _platforms_of(current).items():
+        new_p = _optional_state(_dict_or_empty(pdata).get("state"), allowed=_KNOWN_PLATFORM_STATES)
+        old_p = _optional_state(_dict_or_empty(old_platforms.get(platform, {})).get("state"),
+                                allowed=_KNOWN_PLATFORM_STATES)
+        if new_p and old_p != new_p:
+            return True
+    return False
+
+
 def emit_runtime_status_transition(previous: Optional[dict[str, Any]], current: dict[str, Any]) -> None:
     """Emit immediate content-free gateway events for runtime status changes.  Called by
     gateway.status.write_runtime_status after persisting; fully fail-open."""
     try:
+        if not _has_transition(previous, current):
+            return
         ctx = dict(profile=_safe_profile(), version=_safe_version())
         for ev in _lifecycle_events(previous, current, **ctx) + _platform_events(previous, current, **ctx):
             emitter.emit(ev)

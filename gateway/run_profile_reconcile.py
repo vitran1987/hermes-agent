@@ -40,6 +40,30 @@ _PROFILE_SIGNATURE_FILES = (".env",)  # config.yaml: the config backend's versio
 _OWN_GATEWAY_PROBE_TIMEOUT_SECS = 5.0
 
 
+def _added_profile_preflight(get_default_hermes_root) -> tuple:
+    """Blocking half of ``_multiplex_for_added_profile``'s preflight — runs OFF the event loop.
+
+    Every probe here touches the filesystem: the gateway's recorded standalone reason reads (and
+    parses) this home's ``gateway_state.json``, the two ``resolve`` calls walk the realpath, and
+    ``profiles_to_serve`` lists ``profiles/``. The watcher asks on every tick, so on the loop this
+    was the largest measured wedge (16 of 42 watchdog dumps: the loop thread inside
+    ``read_runtime_status -> _read_json_file -> open``).
+
+    Returns ``(standalone_reason, launch_home, launch_is_root, served_profile_count)``. Every field
+    the async caller needs is read here once, in one hop; the caller keeps only the comparisons.
+    """
+    from hermes_cli.gateway_multiplex_mode import recorded_standalone_reason
+    from hermes_cli.profiles import profiles_to_serve
+    from hermes_constants import get_process_hermes_home
+    launch = get_process_hermes_home().resolve()
+    return (
+        recorded_standalone_reason(),
+        launch,
+        launch == get_default_hermes_root().resolve(),
+        len(profiles_to_serve(multiplex=True, include_parked=True)),
+    )
+
+
 def _stat_signature(path: Path) -> Optional[tuple]:
     try:
         return file_cache_version(path, always_digest=True)  # stored, compared on a later tick
@@ -366,9 +390,8 @@ class GatewayProfileReconcileMixin:
         (re-read on every rescan: setting it back to true converges without a restart). True when armed."""
         from hermes_cli.gateway_multiplex_mode import (
             AUTO_MIGRATION_OPTED_OUT_REASON, SINGLE_PROFILE_REASON, MultiplexDecision, log_multiplex_decision,
-            record_multiplex_decision, recorded_standalone_reason)
-        from hermes_cli.profiles import profiles_to_serve
-        from hermes_constants import get_default_hermes_root, get_process_hermes_home
+            record_multiplex_decision)
+        from hermes_constants import get_default_hermes_root
         # Serialized with reconcile: a second rescan (watcher + creator) resuming mid-activation
         # reset the reservation the first one's reconcile had already grown.
         async with self._reconcile_lock():
@@ -376,12 +399,17 @@ class GatewayProfileReconcileMixin:
                 return True  # a concurrent rescan activated while this one waited
             if not self._running or getattr(self, "_draining", False):
                 return False  # shutdown began: never arm fail-closed secrets under drain-time work
-            if recorded_standalone_reason() not in (SINGLE_PROFILE_REASON, AUTO_MIGRATION_OPTED_OUT_REASON):
+            # The preflight is four filesystem probes (this home's gateway_state.json, three
+            # realpath walks, the profiles/ listing) and it runs every watcher tick. On the loop
+            # it was the single largest measured wedge — 16 of the 42 watchdog dumps had the loop
+            # thread inside this read — so the whole probe runs off-loop.
+            reason, launch, launch_is_root, served_profiles = await asyncio.to_thread(
+                _added_profile_preflight, get_default_hermes_root)
+            if reason not in (SINGLE_PROFILE_REASON, AUTO_MIGRATION_OPTED_OUT_REASON):
                 return False
-            launch = get_process_hermes_home().resolve()
-            if launch != get_default_hermes_root().resolve():
+            if not launch_is_root:
                 return False  # only the default home runs the multiplexer (``_launch_home_may_multiplex``)
-            if len(profiles_to_serve(multiplex=True, include_parked=True)) < 2:
+            if served_profiles < 2:
                 return False
             blocker = await self._run_housekeeping_in_executor(_added_profile_blocker, launch)
             if blocker is not None:

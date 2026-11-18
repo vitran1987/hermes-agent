@@ -1303,10 +1303,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _heartbeat_loop(self) -> None:
         while self.is_connected:
-            self._publish_runtime_status()
+            await self._publish_runtime_status_off_loop()
             if not self.is_connected:
                 break
             await asyncio.sleep(API_SERVER_HEARTBEAT_SECONDS)
+
+    async def _publish_runtime_status_off_loop(self) -> None:
+        """Heartbeat publish with the prepare/enqueue off the event loop.
+
+        The status merge is cheap, but its first call touches the filesystem (pid record, code
+        identity) and the loop-liveness watchdog probes THIS loop; a heartbeat must never be able
+        to block it. The payload is unchanged — ``_write_runtime_status_safe_async`` wraps the same
+        synchronous merge.
+        """
+        self._metrics_last_heartbeat_at = time.time()
+        await self._write_runtime_status_safe_async(
+            "api_server_heartbeat",
+            platform_state="connected" if self.is_connected else "disconnected",
+            platform_metrics=self._api_server_status_payload(),
+        )
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -2272,8 +2287,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /health/detailed — gateway state, platforms, PID for dashboard probing (Bearer auth)."""
         from gateway.status import (
             derive_gateway_busy, derive_gateway_drainable, normalize_updated_at, parse_active_agents,
-            read_runtime_status)
-        runtime = read_runtime_status() or {}
+            read_runtime_status_async)
+        # The status file is a filesystem read; the loop-liveness watchdog probes this loop, so the
+        # read runs off it (the reconciler's identical read was a measured wedge: 17 of 42 dumps).
+        runtime = await read_runtime_status_async() or {}
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
 # Serve the live adapter's own metrics alongside the persisted platform map: the

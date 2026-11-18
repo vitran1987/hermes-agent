@@ -780,7 +780,10 @@ class SessionAuthority:
 
     async def receipt(self, actor, ref, admission_id):
         self.authorize(actor, ref, 'session:submit')
-        row = get_session_admission(self.db, admission_id=admission_id)
+        # Read the admission off the loop: it is a SQLite read that waits on the store's reader
+        # pool, and a receipt poller can run it many times a second (a measured watchdog dump had
+        # the loop thread inside get_session_admission from here).
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
         from gateway.owner_identity import same_owner
@@ -815,7 +818,7 @@ class SessionAuthority:
         except RuntimeStoreError as exc:
             if exc.reason != 'stale_generation':
                 raise
-        row = get_session_admission(self.db, admission_id=admission_id)
+        row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         if row is None or row['status'] != 'started':
             raise RuntimeStoreError('stale_generation')
         return row
@@ -881,11 +884,11 @@ class SessionAuthority:
         closed a session whose turn recovered ``unknown`` (gateway/session_viewer_close), or when an
         unattended automation turn settles itself (``notice``: its transcript copy, GW-10)."""
         captured = self.pending_results.get(admission_id)
-        before = get_session_admission(self.db, admission_id=admission_id)
+        before = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         prepared = None
         if captured is not None and before is not None and before['status'] == 'unknown':
             from gateway.session_results import prepare_result
-            row = get_session_admission(self.db, admission_id=admission_id)
+            row = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
             prepared = prepare_result(row, captured['result'].get('final_response') or '', 'completed', captured)
         # The transcript boundary commits WITH the terminal transition: a follower can never be
         # claimed with the discarded text left open to be merged into its request. With a captured
@@ -1100,7 +1103,7 @@ class SessionAuthority:
                         await asyncio.to_thread(service.check_admission, ref, first)
                     # Cancellation may advance the FIFO while the source owner is awaited;
                     # the successor must earn its own reauthorization, not inherit this one.
-                    current = get_session_admission(self.db, admission_id=first['admission_id'])
+                    current = await asyncio.to_thread(get_session_admission, self.db, admission_id=first['admission_id'])
                     if current is None or current['status'] != 'queued':
                         return False, first
                 if 'local_automation_v1' in first['payload']:
@@ -1127,7 +1130,7 @@ class SessionAuthority:
                                    self.runner._adapter_for_source(live.source))
                 # Cancellation may advance FIFO while the connector is awaited.
                 # Never let the successor inherit this row's fresh verdict.
-                current = get_session_admission(self.db, admission_id=first['admission_id'])
+                current = await asyncio.to_thread(get_session_admission, self.db, admission_id=first['admission_id'])
                 if current is None or current['status'] != 'queued':
                     return False, first
             if first is not None and live.source.platform == Platform.API_SERVER:
@@ -1187,7 +1190,7 @@ class SessionAuthority:
         """Settle the queued head a preclaim check refused as cancelled: its waiters get *reason* (the
         ingress notice, the API's refusal) and its successors revalidate on their own merits."""
         from gateway.session_runtime_workers import tracked_write
-        before = get_session_admission(self.db, admission_id=admission_id)
+        before = await asyncio.to_thread(get_session_admission, self.db, admission_id=admission_id)
         if before is not None and before['status'] == 'queued':
             # Owed from before the write, as in _commit_cancel: storage failing after the commit leaves
             # it for the drain's retry of this exact refusal (or an explicit cancel) to pay.

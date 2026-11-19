@@ -192,17 +192,21 @@ class DurableTurnLease:
             if agent._execution_thread_id is not None:
                 _set_interrupt(False, agent._execution_thread_id)
 
-    def _stop_on_exhausted_authority(self) -> bool:
-        """State.db stayed locked until no renewal can land before the row expires: stop now."""
-        logger.warning("Session turn lease refresh stayed locked through its lifetime: %s", self._current_session_id())
+    def _stop_on_exhausted_authority(self, failure: str = "stayed locked") -> bool:
+        """No renewal can land before the row expires: stop now.
+
+        ``failure`` names the retryable fault that kept burning attempts (a SQLite lock, or a lost
+        worker receipt), so the log line says what actually happened instead of always blaming a lock.
+        """
+        logger.warning("Session turn lease refresh %s through its lifetime: %s", failure, self._current_session_id())
         self._interrupt_turn("Session turn lease could not be refreshed; stopping to protect the transcript.")
         return False
 
     def refresh_tick(self):
         """One periodic renewal (every ``refresh_interval`` via the shared scheduler). A real
-        miss (rowcount 0) or a non-lock error interrupts the turn. A SQLite lock is a missed
-        tick only while the next attempt still lands before ``_authority_deadline``. Returning
-        False stops the timer.
+        miss (rowcount 0) or a non-lock error interrupts the turn. A SQLite lock — or a lost
+        worker receipt, whose write may already have landed — is a missed tick only while the
+        next attempt still lands before ``_authority_deadline``. Returning False stops the timer.
 
         Acquisition reclaims a row once ``expires_at <= now``, even if the old process is
         alive. Holder-qualified release does not block that path, so a run of lock errors
@@ -237,15 +241,22 @@ class DurableTurnLease:
         except Exception as exc:
             if self.stop.is_set():
                 return False
-            from hermes_state_errors import is_sqlite_lock_error
+            from hermes_state_errors import is_sqlite_lock_error, is_worker_receipt_timeout
 
-            if is_sqlite_lock_error(exc):
+            lock_error = is_sqlite_lock_error(exc)
+            # A lost receipt is as recoverable as a lock: the owner may have landed the write and
+            # merely lost the ACK, and the outbox replays that entry to its original receipt. It
+            # used to hard-interrupt turns whose transcript row landed 12-18 s later.
+            lost_receipt = is_worker_receipt_timeout(exc)
+            if lock_error or lost_receipt:
                 # The scheduler will not try again until one interval from now. If that attempt
                 # could not finish before the row expiry, stop before a successor can claim it.
                 if time.time() + self.refresh_interval + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
-                    return self._stop_on_exhausted_authority()
+                    return self._stop_on_exhausted_authority(
+                        "kept losing its owner's receipt" if lost_receipt else "stayed locked")
                 logger.warning(
-                    "Session turn lease refresh hit a SQLite lock; will retry: %s",
+                    "Session turn lease refresh %s; will retry: %s",
+                    "lost its owner's receipt" if lost_receipt else "hit a SQLite lock",
                     self._current_session_id(),
                 )
                 return None

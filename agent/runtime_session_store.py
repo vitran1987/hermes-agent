@@ -17,7 +17,7 @@ import queue
 import sys
 import threading
 from hermes_dir_acl import make_user_dir
-from hermes_state_errors import WorkerReceiptTimeout
+from hermes_state_errors import WorkerReceiptTimeout, is_worker_receipt_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -327,7 +327,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:
-                raise WorkerPersistenceError('pending_receipt')
+                # An entry is journalled BEFORE it is sent and an exact re-send resolves to its
+                # ORIGINAL receipt, so replaying it is idempotent (same ``sequence``, no duplicate).
+                # Refusing with ``pending_receipt`` turned one late ACK into a dead session.
+                self.retry_pending()
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
@@ -354,7 +357,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
-                self.failure = str(exc)
+                # A lost receipt is not a durable failure: the owner may have applied the write and
+                # lost only the ACK, so leave ``failure`` clear and let the next persist replay this
+                # same entry. Latching it here failed every later persist in the process instantly.
+                self.failure = None if is_worker_receipt_timeout(exc) else str(exc)
                 raise
             self.failure = None
             return results

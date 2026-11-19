@@ -1,3 +1,14 @@
+# Baseline EOL policy (kanban t_bc5f9086). Every text file is normalized to LF
+# in the object store AND checked out as LF, so a CRLF write by any Windows tool
+# (PowerShell Out-File/Set-Content, `git checkout` under the system-wide
+# core.autocrlf=true, sync/copy scripts) can no longer surface as a whole-tree
+# phantom "modified" diff. Without this baseline ~1.3k files read as modified
+# with a real diff of zero, which forces `hermes update` to autostash the whole
+# tree and makes snapshot/backup copying churn on noise instead of the delta.
+# `text=auto` still detects binaries by content; the specific rules below win
+# over this line because in .gitattributes the LAST matching pattern decides.
+* text=auto eol=lf
+
 # Auto-generated files — collapse diffs and exclude from language stats
 pnpm-lock.yaml linguist-generated=true
 **/package-lock.json linguist-generated=true
@@ -37,3 +48,16 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+# Windows launchers/scripts keep CRLF: cmd.exe parses line-wise and a lone LF
+# breaks `%~dp0` expansion and .cmd argument continuation.
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Binary payloads: never normalize, never diff.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.ico    binary
+*.pdf    binary
+*.bundle binary

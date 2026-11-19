@@ -21,6 +21,15 @@ from hermes_state_errors import WorkerReceiptTimeout
 
 logger = logging.getLogger(__name__)
 
+#: How long a worker waits for a ``worker.persist`` receipt before calling its owner unresponsive.
+#: It MUST outlive the owner's own write patience — ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``
+#: (60 s), which ``apply_worker_receipt`` uses — or a slow-but-alive owner can never answer in
+#: time. When this was a hard-coded 20 s, the owner's row landed 12-18 s AFTER the worker had
+#: given up (463 ``worker_receipt_timeout`` events on one profile in one day), and every one of
+#: them killed a turn whose write had actually succeeded. A test asserts the invariant against the
+#: owner's constants so raising either side cannot silently re-open the gap.
+_RECEIPT_BUDGET_S = 90.0
+
 _worker_process = False
 
 
@@ -195,7 +204,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(_RECEIPT_BUDGET_S)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

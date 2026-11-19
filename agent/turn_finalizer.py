@@ -53,16 +53,29 @@ def _record_kanban_budget_exhausted(
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
     (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
 
+    The breaker budget is the one the card was DISPATCHED under, read back from the
+    ``claimed`` event (``kanban_db_claim_budget.dispatched_failure_limit``) and forwarded as
+    ``failure_limit=``. Omitting it made the breaker substitute ``DEFAULT_FAILURE_LIMIT = 2``,
+    parking cards on their second budget exhaustion even on a board configured for 4 (#87096's
+    sibling paths were fixed the same way). Re-deriving it from config here would read THIS
+    profile's home, not the dispatcher's — a different island that usually resolves the built-in
+    2 — so the budget travels on the board instead. An unstamped claim (control-plane lane)
+    passes ``None``, keeping the breaker's own default.
+
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
     """
     try:
         from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_claim_budget as _kbcb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
+            _failure_limit = None
+            with suppress(Exception):
+                _failure_limit = _kbcb.dispatched_failure_limit(_conn, kanban_task)
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,
@@ -71,6 +84,7 @@ def _record_kanban_budget_exhausted(
                     "task could not complete within the allowed iterations"
                 ),
                 outcome="timed_out",
+                failure_limit=_failure_limit,
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},

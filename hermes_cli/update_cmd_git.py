@@ -673,14 +673,16 @@ def _discard_lockfile_churn(git_cmd, repo_root, *, checkout_move=None):
 
 
 def _normalize_managed_eol(git_cmd, repo_root, *, checkout_move=None):
-    """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
+    """Clear CRLF churn from a managed checkout, and take it off ``core.autocrlf=true`` when it is set.
 
     Git for Windows sets ``autocrlf=true`` system-wide, turning LF files CRLF and breaking ``git checkout``
     on update; install.ps1 pins ``false`` but older checkouts never got it and only ``hermes update`` can
-    fix them. Pin and cleanup are one operation: under ``autocrlf=true`` a CRLF tree reads clean, so pinning
-    alone would expose every file as modified (whole-tree autostash). Pin only after the tree verifies clean
-    under it; a checkout we can't fully normalize is left as-is. Only ``true`` rewrites LF->CRLF
-    (unset/false/input leave the tree alone). Best-effort.
+    fix them. The cleanup is NOT conditional on the setting: a checkout that already says ``false`` is
+    where the churn hurts most, because git then compares literally and every CRLF file reads modified
+    (whole-tree autostash). Only the pin is conditional, and for the opposite reason — under
+    ``autocrlf=true`` a CRLF tree reads clean, so pinning before the churn is gone would expose every file
+    as modified. A checkout we can't fully normalize keeps its setting untouched. Only ``true`` rewrites
+    LF->CRLF (unset/false/input leave the tree alone). Best-effort.
 
     Checkouts created before that landed never got the pin and cannot receive it — the bootstrap installer
     reuses its build-pinned ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
@@ -710,8 +712,12 @@ def _normalize_managed_eol(git_cmd, repo_root, *, checkout_move=None):
         }
 
     with suppress(Exception):
-        if _git_run(git_cmd, ["config", "--get", "core.autocrlf"], repo_root).stdout.strip().lower() != "true":
-            return
+        # The value decides only whether the pin at the end is still owed: the cleanup runs on every
+        # checkout, because the churn a past ``autocrlf=true`` wrote stays on disk after the pin lands,
+        # and ``false`` is where install.ps1 puts new checkouts — so gating on it made every line below
+        # dead code on the trees that needed it most (1,348 dirty files, empty --ignore-cr-at-eol diff).
+        pin_needed = (_git_run(git_cmd, ["config", "--get", "core.autocrlf"], repo_root)
+                      .stdout.strip().lower() == "true")
         eol_only = _eol_only()
         if eol_only is None:
             return
@@ -723,5 +729,6 @@ def _normalize_managed_eol(git_cmd, repo_root, *, checkout_move=None):
             if _eol_only():  # still dirty: pinning would only surface churn we failed to clear
                 return
             print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
-        run_git(git_cmd, ["config", "core.autocrlf", "false"], cwd=repo_root, capture_output=True, check=False,
-                creationflags=windows_hide_flags())
+        if pin_needed:
+            run_git(git_cmd, ["config", "core.autocrlf", "false"], cwd=repo_root, capture_output=True,
+                    check=False, creationflags=windows_hide_flags())

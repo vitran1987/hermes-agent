@@ -171,15 +171,39 @@ def test_pin_is_withheld_when_the_churn_cannot_be_cleared(tmp_path: Path) -> Non
     assert b"\r\n" in (repo / "a.py").read_bytes()
 
 
-def test_already_pinned_checkout_is_untouched(tmp_path: Path) -> None:
-    repo = _managed_repo(tmp_path, {"a.py": b"x = 1\n"})
+def test_churn_is_cleared_even_when_autocrlf_is_already_false(tmp_path: Path) -> None:
+    """The churn a past ``autocrlf=true`` wrote outlives the setting itself.
+
+    ``core.autocrlf=false`` is where ``install.ps1`` pins a new checkout, so a
+    CRLF worktree under it is the common breakage rather than an exotic one: git
+    then compares literally, every one of those files reads modified, and the
+    update autostashes the whole tree. Gating the cleanup on ``autocrlf=true``
+    made this branch dead code on exactly those checkouts (measured on one real
+    tree: 1,348 dirty files whose ``--ignore-cr-at-eol`` diff was empty).
+    """
+    repo = _managed_repo(tmp_path, {"a.py": b"x = 1\ny = 2\n"})
     _git(repo, "config", "core.autocrlf", "false")
+    assert _dirty(repo) == {"a.py"}
 
     _normalize_managed_eol(GIT_CMD, repo)
 
-    # Nothing to repair from this function's perspective: autocrlf is not true,
-    # so it must not start restoring files behind the user's back.
-    assert _dirty(repo) == {"a.py"}
+    assert _dirty(repo) == set()
+    assert b"\r\n" not in (repo / "a.py").read_bytes()
+    # Nothing to pin: the local setting already says false and must stay as found.
+    assert _autocrlf(repo) == "false"
+
+
+def test_real_edits_survive_when_autocrlf_is_already_false(tmp_path: Path) -> None:
+    """Clearing churn on an unpinned tree still never eats a real change."""
+    repo = _managed_repo(tmp_path, {"churn.py": b"y = 2\n", "both.py": b"z = 3\n"})
+    _git(repo, "config", "core.autocrlf", "false")
+    # A genuine edit that ALSO got renormalized must not be discarded.
+    (repo / "both.py").write_bytes(b"z = 3\r\nz += 1\r\n")
+
+    _normalize_managed_eol(GIT_CMD, repo)
+
+    assert _dirty(repo) == {"both.py"}
+    assert (repo / "both.py").read_bytes() == b"z = 3\r\nz += 1\r\n"
 
 
 def test_autocrlf_input_is_left_alone(tmp_path: Path) -> None:

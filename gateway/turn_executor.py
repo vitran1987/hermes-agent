@@ -15,11 +15,12 @@ _IDLE_TIMEOUT_S = 60.0
 
 
 class _Worker:
-    __slots__ = ("inbox", "thread")
+    __slots__ = ("inbox", "parked", "thread")
 
     def __init__(self) -> None:
         self.thread: threading.Thread | None = None
         self.inbox: queue.SimpleQueue = queue.SimpleQueue()
+        self.parked = threading.Event()
 
 
 class _UnboundedThreadExecutor(concurrent.futures.Executor):
@@ -74,7 +75,45 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             self._threads.add(t)
         return fut
 
+    def prewarm(self, count: int = 1) -> int:
+        """Start *count* parked workers now so the first submits are queue puts, not thread starts.
+
+        ``submit`` runs on the event loop and ``Thread.start()`` waits there until the new thread
+        gets the GIL — the measured gateway wedge was exactly that, inside the goals/loop watcher's
+        first off-loop hop. Calling this once from a startup worker thread (never from the loop
+        itself) means every later submit finds an idle thread to hand its item to. Returns only
+        once the workers are parked and claimable, so the caller's next submit cannot race them.
+        """
+        workers: list[_Worker] = []
+        with self._lock:
+            if self._shutdown:
+                return 0
+            while len(workers) < count:
+                self._n += 1
+                worker = _Worker()
+                t = threading.Thread(target=self._work, args=(worker, None),
+                                     name=f"{self._prefix}_idle_{self._n}", daemon=True)
+                worker.thread = t
+                workers.append(worker)
+                # Start under the lock, as submit() does, so a concurrent shutdown() either
+                # refuses this batch or sees every thread it just created.
+                t.start()
+        for worker in workers:
+            # The worker parks itself (resetting its thread state first); wait OUTSIDE the lock —
+            # _park takes that same lock to publish itself as idle.
+            worker.parked.wait(timeout=5.0)
+        return len(workers)
+
+    @property
+    def idle_workers(self) -> int:
+        """Number of warm, parked workers a submit can hand an item to right now."""
+        with self._lock:
+            return len(self._idle)
+
     def _work(self, worker: _Worker, item) -> None:
+        if item is None:
+            # Prewarmed worker: park first instead of exiting, so submit() finds it idle.
+            item = self._park(worker)
         while item is not None:
             fut, fn, args, kwargs = item
             del item
@@ -102,6 +141,7 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             if self._shutdown or not reusable:
                 return None
             self._idle.append(worker)
+            worker.parked.set()  # prewarm() waits on this outside the lock
         try:
             return worker.inbox.get(timeout=self._idle_timeout)
         except queue.Empty:

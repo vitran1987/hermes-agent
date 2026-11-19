@@ -49,10 +49,17 @@ class GatewayGoalsMixin:
     async def _warm_goals_session_db(self, label: str) -> None:
         """Warm the goals SessionDB cache off-loop (best-effort): a cold cache runs the state.db
         init on the loop thread and freezes the loop. The executor hop keeps the profile home
-        override alive under multiplex; a failed warm-up is a bounded stall, never a crash."""
+        override alive under multiplex; a failed warm-up is a bounded stall, never a crash.
+
+        Once the cache is warm (startup warms it, and every later hop does too) this is a dict
+        lookup and NO executor submit: ``submit`` runs on the loop and, when no worker is parked,
+        starts a thread there — the measured wedge in the loop-wakeup watcher.
+        """
         try:
             from hermes_cli.goals import _get_session_db as _warm_goals_db
-
+            from hermes_cli.goals import session_db_is_warm
+            if session_db_is_warm():
+                return
             await self._run_in_executor_with_context(_warm_goals_db)
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)

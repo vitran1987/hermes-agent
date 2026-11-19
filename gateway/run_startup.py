@@ -8,11 +8,13 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import faulthandler
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
@@ -81,6 +83,44 @@ def _own_policy_envs(platform) -> Optional[tuple]:
     if not own:
         return None
     return (*own, authz_field(platform.value, "allow_all_env", entry))
+
+
+# The loop's own off-load pool (``asyncio.to_thread`` / ``run_in_executor(None, ...)``). asyncio's
+# default is created lazily ON THE LOOP and each new worker is started by ``Thread.start()`` in the
+# SUBMITTING thread — the same loop-blocking call this module prewarms away for the gateway's own
+# pools. Sized like the stdlib default so a caller that used to fit in the implicit pool still does.
+_LOOP_IO_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+_LOOP_IO_PREWARM = 4
+
+
+def _build_loop_io_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Create AND prewarm the loop's off-load pool. BLOCKING — never call this from the loop.
+
+    ``_LOOP_IO_PREWARM`` threads are started by the CALLER's thread and left parked, so the
+    steady-state ``asyncio.to_thread`` hops (receipt polls, status publishes, the reconcile
+    preflight) are queue puts, not thread starts. Growth past the warm count still costs one
+    start per worker, exactly as without this. Fully fail-open on a slow host.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_LOOP_IO_WORKERS, thread_name_prefix="hermes-loop-io")
+    gate = threading.Event()
+    starters = [executor.submit(gate.wait) for _ in range(_LOOP_IO_PREWARM)]
+    gate.set()
+    for starter in starters:
+        with suppress(Exception):  # fail-open: a warm-up that timed out still leaves a usable pool
+            starter.result(timeout=5)
+    return executor
+
+
+def _install_loop_io_executor(loop) -> concurrent.futures.Executor:
+    """Build the pool (thread starts happen HERE) and hand it to *loop* as its default.
+
+    Called from a startup worker thread during the prewarm, or directly by a test: the thread
+    starts land on the caller, never on the loop the liveness watchdog probes.
+    """
+    executor = _build_loop_io_executor()
+    loop.set_default_executor(executor)
+    return executor
 
 
 class GatewayStartupMixin:
@@ -962,6 +1002,74 @@ class GatewayStartupMixin:
                     _sigusr2, file=self._open_faulthandler_log(), all_threads=True, chain=False,
                 )
 
+    async def _prewarm_loop_blocking_helpers(self) -> None:
+        """Create the off-loop worker threads and one-time identity state at startup.
+
+        ``run_in_executor``'s ``Thread.start()`` runs on the CALLING thread and waits until the new
+        thread bootstraps; on a loaded host that wait landed on the event loop and the liveness
+        watchdog killed the gateway for it (measured: 42 dumps, one inside the goals warm-up).
+        Everything the serving loop offloads is therefore started here — once, before adapters
+        connect, where a one-time cost cannot wedge a serving loop. Fully fail-open.
+
+        The warm-up runs on ONE raw thread started here, not through ``asyncio.to_thread``: the
+        loop's default executor is replaced by this same step (see ``_install_loop_io_executor``),
+        so the hop that installs it must not itself land on the pool being replaced.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: nothing to prewarm
+            return
+        # Carries the prewarmed pool (or None) back to the loop; the swap itself happens ON the
+        # loop, where ``set_default_executor`` is just an assignment — the thread starts that make
+        # it expensive already happened on the raw startup thread below.
+        done: concurrent.futures.Future = concurrent.futures.Future()
+
+        def work() -> None:
+            try:
+                self._prewarm_worker_threads()
+            except BaseException:  # health: allow BLE001 -- fail-open, the gateway still serves
+                logger.debug("Gateway startup warm-up failed", exc_info=True)
+            try:
+                executor = _build_loop_io_executor()
+            except BaseException:  # health: allow BLE001 -- fail-open: the loop keeps its lazy pool
+                logger.debug("Loop I/O pool prewarm failed", exc_info=True)
+                executor = None
+            done.set_result(executor)
+
+        try:
+            threading.Thread(target=work, name="hermes-startup-prewarm", daemon=True).start()
+            executor = await asyncio.wait_for(asyncio.wrap_future(done), timeout=60)
+            if executor is not None:
+                loop.set_default_executor(executor)
+        except Exception:
+            logger.debug("Gateway startup warm-up failed", exc_info=True)
+
+    def _prewarm_worker_threads(self) -> None:
+        """Start the gateway's own pools and resolve one-time identity/database state, off the loop."""
+        from gateway.status import warm_runtime_status_publishing
+        with _log_suppressed(logging.DEBUG, "Runtime status warm-up failed", exc_info=True):
+            warm_runtime_status_publishing()
+        with _log_suppressed(logging.DEBUG, "Goals SessionDB warm-up failed", exc_info=True):
+            # The loop-wakeup watcher warms this on every tick; doing it here means its first tick
+            # finds the cache warm and never needs an executor hop at all.
+            from hermes_cli.goals import _get_session_db
+            _get_session_db()
+        pool_getters = (getattr(self, "_get_executor", None), getattr(self, "_get_housekeeping_executor", None))
+        for name, get_pool in zip(("executor", "housekeeping"), pool_getters):
+            if get_pool is None:
+                continue
+            # Per-pool: a shutting-down runner raises from one getter, and the other pool plus the
+            # two warm-ups above must still land.
+            with _log_suppressed(logging.DEBUG, f"{name} pool prewarm failed", exc_info=True):
+                pool = get_pool()
+                prewarm = getattr(pool, "prewarm", None)
+                if prewarm is not None:
+                    prewarm(2)
+                else:
+                    # A ThreadPoolExecutor starts its workers on submit; start one from THIS thread
+                    # so a later submit from the loop hands it work instead of spawning a worker.
+                    pool.submit(lambda: None).result(timeout=5)
+
     async def _start_log_startup_environment(self) -> None:
         """Bind the gateway loop, disarm the startup watchdog, and log the startup environment."""
         try:
@@ -975,6 +1083,7 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "Startup watchdog disarm failed", exc_info=True):
                 from hermes_startup_watchdog import disarm_startup_watchdog
                 disarm_startup_watchdog()
+            await self._prewarm_loop_blocking_helpers()
         logger.info("Session storage: %s", self.config.sessions_dir)
         self._start_log_systemd_timing_alignment()
         self._start_log_retired_session_reset()

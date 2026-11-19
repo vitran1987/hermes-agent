@@ -2106,6 +2106,26 @@ class BasePlatformAdapter(ABC):
                 "Failed to write runtime status (%s) for %s: %s" + (" (further failures at debug level)" if first else ""),
                 context, self.platform.value, exc)
 
+    async def _write_runtime_status_safe_async(self, context: str, **kwargs) -> None:
+        """``_write_runtime_status_safe`` for async callers: the publish runs off the event loop.
+
+        The prepare half of a status publish resolves the home (``realpath``), reads the existing
+        record and emits transitions; on the loop those are blocking filesystem calls that the
+        loop-liveness watchdog measures. Async adapters (heartbeat loops) use this form, which
+        publishes the identical payload through ``publish_runtime_status_async``.
+        """
+        try:
+            from gateway.status import publish_runtime_status_async
+            platform_key = getattr(self, "_runtime_status_platform_key", None) or self.platform.value
+            await publish_runtime_status_async(platform=platform_key, **kwargs)
+        except Exception as exc:
+            logged = _lazy_attr(self, "_status_write_logged", set)  # object.__new__ in tests
+            first = (self.platform.value, context) not in logged
+            logged.add((self.platform.value, context))
+            (logger.warning if first else logger.debug)(
+                "Failed to write runtime status (%s) for %s: %s" + (" (further failures at debug level)" if first else ""),
+                context, self.platform.value, exc)
+
     async def _notify_fatal_error(self) -> None:
         handler = self._fatal_error_handler
         if not handler:

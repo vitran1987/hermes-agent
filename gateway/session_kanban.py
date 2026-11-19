@@ -88,19 +88,30 @@ async def run_task(connection, params):
     # task closes. Retry checks the saved claim, never reinterprets updated cards.
     request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
     sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
-    saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
-    if saved:
-        policy = restore_policy(saved['policy'])
-        context = json.loads(policy.kanban_json or '{}')
-        if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
-                or any(params[k] != context.get(k) for k in params)):
-            raise RuntimeStoreError('permission_denied')
-        from gateway.session_local_recovery import restore_local_session
-        ref = restore_local_session(authority, sid)
-    else:
+
+    def resolve_session():
+        """The saved-claim check and, when there is none, session creation — one off-loop hop.
+
+        Both halves are a session-store read plus a write transaction, and both open the
+        ``state.db``; on the loop they froze it for the watchdog (measured:
+        ``commit_local_session`` and ``build_worker_context`` leaves). They stay in ONE hop on
+        purpose: no await may separate the check from the creation, so a concurrent retry of the
+        same attempt meets the committed receipt or a stale claim, never a half-created session.
+        """
+        saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
+        if saved:
+            policy = restore_policy(saved['policy'])
+            context = json.loads(policy.kanban_json or '{}')
+            if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
+                    or any(params[k] != context.get(k) for k in params)):
+                raise RuntimeStoreError('permission_denied')
+            from gateway.session_local_recovery import restore_local_session
+            return bool(saved), policy, restore_local_session(authority, sid)
         policy, private = build_kanban_policy(connection, params, _load_gateway_config())
-        ref = create_local_session(authority, connection.actor, {'request_id': request_id},
-                                   trusted_policy=policy, trusted_secrets=private)
+        return False, policy, create_local_session(authority, connection.actor, {'request_id': request_id},
+                                                   trusted_policy=policy, trusted_secrets=private)
+
+    saved, policy, ref = await asyncio.to_thread(resolve_session)
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     import os

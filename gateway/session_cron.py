@@ -174,14 +174,16 @@ async def operation(authority, name, params, actor=None):
         request_id = cron_request_id(params['job_id'], params['request_id'])
         sid = local_identity(authority.profile_id, actor.subject, request_id)
         from hermes_state_runtime import list_session_admissions
-        rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        # The admission history is a sqlite scan: it runs off the loop (the same leaf the watchdog
+        # measured under ``scheduler_authority.observe``).
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid, pending_only=False)
         from gateway.owner_identity import same_owner
         row = next((r for r in rows if r['request_id'] == request_id and same_owner(r['principal_id'], actor.subject)), None)
         if row is None:
             return {'status': 'missing', 'result': None}
         state = await operation(authority, 'status', {'session_id': sid, 'admission_id': row['admission_id']}, actor)
         from gateway.session_local_recovery import restore_local_session
-        restore_local_session(authority, sid)
+        await asyncio.to_thread(restore_local_session, authority, sid)
         from gateway.config import Platform
         from gateway.session_local_recovery import local_adapter_map
         policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]
@@ -205,7 +207,7 @@ async def operation(authority, name, params, actor=None):
             from gateway.session_local_recovery import restore_local_session
             from hermes_state_local import commit_local_session
             await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
-            ref = restore_local_session(authority, ref['session_id'])
+            ref = await asyncio.to_thread(restore_local_session, authority, ref['session_id'])
         receipt = await tracked_write(authority, partial(
             admit_session_input, authority.db, epoch=authority.epoch, principal_id=actor.subject,
             session_id=ref.session_id, request_id=request_id, payload={'text': params['extra_prompt'] or ''},
@@ -216,7 +218,7 @@ async def operation(authority, name, params, actor=None):
         raise RuntimeStoreError('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
     authority.authorize(actor, ref, 'session:submit')
-    row = get_session_admission(authority.db, admission_id=params['admission_id'])
+    row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=params['admission_id'])
     from gateway.owner_identity import same_owner
     if row is None or row['target_session_id'] != ref.session_id or not same_owner(row['principal_id'], actor.subject):
         raise RuntimeStoreError('permission_denied')

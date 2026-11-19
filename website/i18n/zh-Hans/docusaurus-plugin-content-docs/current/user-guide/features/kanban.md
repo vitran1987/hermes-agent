@@ -826,7 +826,7 @@ hermes kanban runs t_abcd
 |---|---|---|
 | `created` | `{assignee, status, parents, tenant}` | 任务插入。`run_id` 为 `NULL`。 |
 | `promoted` | — | 因所有父任务达到 `done` 而 `todo → ready`。`run_id` 为 `NULL`。 |
-| `claimed` | `{lock, expires, run_id}` | 调度器原子性认领 `ready` 任务以启动。 |
+| `claimed` | `{lock, expires, run_id, failure_limit?}` | 调度器原子性认领 `ready` 任务以启动。由调度器派发的认领（含 review 认领）还会写入 `failure_limit`：本次运行被派发时所依据的熔断预算（由 `kanban.failure_limit` 解析）。之所以要落盘，是因为 worker 自己无法重新解析——它运行在 assignee 的 profile home 中，那里解析出的是该 profile 自己的值（通常未设置 → 内置默认值）——所以预算随看板传递。迭代预算耗尽的 worker 会读回该记录，并按该预算计入 `timed_out`。无调度器的控制平面认领不带此字段，回退到内置默认值。 |
 | `completed` | `{result_len, summary?}` | Worker 写入 `--result` / `--summary` 且任务达到 `done`。`summary` 是第一行交接（400 字符上限）；完整版本存在于运行行上。如果在从未认领的任务上调用 `complete_task` 并带有交接字段，则合成零持续时间运行，以便 `run_id` 仍然指向某处。 |
 | `blocked` | `{reason}` | Worker 或人类将任务翻转为 `blocked`。在带有 `--reason` 的从未认领任务上调用时合成零持续时间运行。 |
 | `unblocked` | — | `blocked → ready`，手动或通过 `/unblock`。`run_id` 为 `NULL`。 |
@@ -854,7 +854,7 @@ hermes kanban runs t_abcd
 | `respawn_guarded` | `{reason}` | 调度器拒绝在本 tick 重新启动此就绪任务。原因：`blocker_auth`（上次失败是配额/认证/429 错误 —— 等待速率窗口重置）、`recent_success`（最近一小时内有完成的运行 —— 在重新运行前等待审查）、`active_pr`（最近的评论中出现 GitHub PR URL —— 先前的 worker 已经打开了 PR）。任务保持在 `ready`；下一个 tick 有另一次启动机会。如果底层条件持续存在，正常的 `consecutive_failures` 熔断器将在 `failure_limit` 次失败后通过 `gave_up` 自动阻塞。 |
 | `spawn_failed` | `{error, failures}` | 一次启动尝试失败（PATH 缺失、工作区无法挂载等）。计数器递增；任务返回 `ready` 重试。 |
 | `protocol_violation` | `{pid, claimer, exit_code}` | Worker 在任务仍处于 `running` 状态时成功退出，通常是因为它回答了问题而没有调用 `kanban_complete` 或 `kanban_block`。调度器还会立即发出 `gave_up` 并自动阻塞，而不是重试。 |
-| `gave_up` | `{failures, effective_limit, limit_source, error}` | N 次连续不成功尝试后熔断器触发。任务以最后一个错误自动阻塞。有效限制解析为任务 `max_retries`，然后是调度器 `failure_limit` / `kanban.failure_limit`，然后是内置默认值；`limit_source` 标明实际生效的来源（`task`、`dispatcher`，或 `default` 表示内置默认值——该路径未收到任何已配置的限制）。 |
+| `gave_up` | `{failures, effective_limit, limit_source, error}` | N 次连续不成功尝试后熔断器触发。任务以最后一个错误自动阻塞。有效限制解析为任务 `max_retries`，然后是调度器 `failure_limit` / `kanban.failure_limit`，然后是内置默认值；`limit_source` 标明实际生效的来源（`task`、`dispatcher`，或 `default` 表示内置默认值——该路径未收到任何已配置的限制）。迭代预算退出（worker 用完 `max_iterations` 并记为 `timed_out`）按自身 `claimed` 事件上记录的预算计费，因此在配置值处触发，而不是内置默认值。 |
 
 `hermes kanban tail <id>` 显示单个任务的这些事件。`hermes kanban watch` 在整个看板范围内流式传输它们。
 

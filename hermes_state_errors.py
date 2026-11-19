@@ -6,6 +6,27 @@ import errno
 import re
 import sqlite3
 
+
+class WorkerReceiptTimeout(TimeoutError):
+    """The owning gateway did not answer a worker RPC inside the receipt budget.
+
+    Measured cause: the owner's event loop stalled (``ws write slow (loop stalled >10.0s)``) or its
+    own write patience (``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``, 60 s) outlived the caller's
+    budget, so the ACK never arrived -- the storage was healthy throughout (126 GB free, one holder
+    per store, zero ``database is locked`` events). The write's outcome is UNKNOWN, not failed, and
+    the worker outbox resolves an exact re-send to its ORIGINAL receipt, so this is retryable and
+    must never be read as a storage fault.
+    """
+
+
+def is_worker_receipt_timeout(exc_or_str) -> bool:
+    """A lost receipt (owner unresponsive): by exception type, or by the RPC-wrapped message."""
+    if isinstance(exc_or_str, WorkerReceiptTimeout):
+        return True
+    return "worker_receipt_timeout" in (
+        exc_or_str if isinstance(exc_or_str, str) else str(exc_or_str or "")
+    ).lower()
+
 # Malformed schema: ``sqlite_master`` itself is inconsistent (typically a DUPLICATE
 # ``CREATE VIRTUAL TABLE messages_fts`` row). SQLite parses the whole schema while
 # preparing the FIRST statement, so EVERY statement raises (even ``PRAGMA
@@ -98,7 +119,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "owner_unresponsive", "unknown",
 )
 
 
@@ -267,6 +288,9 @@ _STATE_DB_CORRUPT_MSG = (
 
 
 _PERSISTENCE_CAUSE_BY_TYPE = (
+    # A receipt budget that elapsed is an OWNER problem, not a storage one: match by type before
+    # anything else so it can never fall through to ``unknown`` -> the disk/lock ``default`` text.
+    (WorkerReceiptTimeout, "owner_unresponsive"),
     (SessionTurnLeaseLostError, "turn_lease"),
     (CompressionSessionClosedError, "compression_closed"),
     (CompressionSessionBusyError, "compression"),
@@ -277,6 +301,9 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbCorruptError, "corrupt"),
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
+    # An RPC-wrapped receipt timeout keeps only its message and carries no storage marker at all
+    # (no "locked"/"busy"/"disk"), so it must be matched on its own before those buckets.
+    (("worker_receipt_timeout",), "owner_unresponsive"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
@@ -299,7 +326,9 @@ def classify_persistence_error(exc_or_str) -> str:
     corruption to the FTS index (the transcript store is not damaged); "replaced" =
     main-file replacement; "deleted_wal" = a retired sidecar generation requiring
     capture inspection; "session_row_missing" = the session row was deleted under a
-    live agent (FK rejection; the flush recreates it)."""
+    live agent (FK rejection; the flush recreates it); "owner_unresponsive" = the
+    owning gateway never answered a worker receipt inside its budget, so the storage
+    is healthy and the write is retryable (its outcome is merely unknown)."""
     if exc_or_str is None:
         return "unknown"
     # Lease refusals contain neither "locked" nor "busy": match by type first,

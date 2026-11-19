@@ -17,6 +17,7 @@ import queue
 import sys
 import threading
 from hermes_dir_acl import make_user_dir
+from hermes_state_errors import WorkerReceiptTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            raise WorkerReceiptTimeout('worker_receipt_timeout') from None
         if isinstance(reply, BaseException):
             raise reply
         return reply

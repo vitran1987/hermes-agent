@@ -26,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from gateway.lifecycle_ledger import (
     check_state_db_integrity,
     get_lifecycle_sentinel_path,
@@ -69,11 +71,13 @@ def _make_state_db(home: Path, *, corrupt: bool, journal_mode: str = "delete") -
     return path
 
 
-def _make_multi_page_state_db(home: Path, rows: int = 300_000) -> Path:
+def _make_multi_page_state_db(home: Path, rows: int = 300_000, journal_mode: str = "delete") -> Path:
     """A store large enough that ``quick_check`` takes measured tens of ms, so a
     wall-clock deadline can fire MID-scan. Cheap to build (~1s)."""
     path = home / "state.db"
     conn = sqlite3.connect(path)
+    if journal_mode != "delete":
+        assert conn.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0] == journal_mode
     conn.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, v TEXT)")
     conn.executemany(
         "INSERT INTO sessions (v) VALUES (?)", [(f"row-{i}" * 40,) for i in range(rows)]
@@ -375,3 +379,157 @@ def test_unclean_exit_check_keeps_the_verdict_contract_under_the_lease(
     assert verdict not in ("ok", "absent") and not verdict.startswith("check-failed")
     assert handle._lease_phase == "state_db_unclean_integrity_check"
     assert check_state_db_integrity(home=tmp_path / "nowhere") == "absent"
+
+
+# ── the budget follows the STORE, and an abort is not a corruption finding ──
+# Measured 2026-11-20 on `profiles/pm-bangioi/state.db` (page_count 892902 x page_size 4096 =
+# 3.66 GB, journal_mode=wal): `PRAGMA quick_check(1)` had NOT finished after 749 s, so the flat
+# 1800 s bound aborted a healthy store and the caller logged the abort as
+# "FAILED integrity check ... Run `hermes doctor`" — 8 such ERRORs, 0 corruptions.
+
+
+def _live_store_bytes() -> int:
+    """The live store the defect was measured on: page_count x page_size."""
+    return 892_902 * 4096
+
+
+def test_deadline_scales_with_the_store_between_floor_and_ceiling() -> None:
+    import gateway.lifecycle_ledger as ledger
+
+    live_budget = ledger._integrity_deadline_for_bytes(_live_store_bytes())
+
+    assert ledger.STATE_DB_INTEGRITY_DEADLINE_S < live_budget < ledger.STATE_DB_INTEGRITY_DEADLINE_CEILING_S
+    assert live_budget > 749.0 * 2, "the budget still aborts the scan that the 749 s probe could not finish"
+
+
+def test_deadline_keeps_the_flat_constant_for_a_small_or_unsized_store() -> None:
+    """Below the floor nothing changes — the historic budget for every store we know is small."""
+    import gateway.lifecycle_ledger as ledger
+
+    assert ledger._integrity_deadline_for_bytes(None) == ledger.STATE_DB_INTEGRITY_DEADLINE_S
+    assert ledger._integrity_deadline_for_bytes(0) == ledger.STATE_DB_INTEGRITY_DEADLINE_S
+    assert ledger._integrity_deadline_for_bytes(512 * 1024**2) == ledger.STATE_DB_INTEGRITY_DEADLINE_S
+    assert ledger._integrity_deadline_for_bytes(1024**3) == ledger.STATE_DB_INTEGRITY_DEADLINE_S
+
+
+def test_deadline_ceiling_still_bounds_a_pathological_store() -> None:
+    import gateway.lifecycle_ledger as ledger
+
+    assert ledger._integrity_deadline_for_bytes(10**13) == ledger.STATE_DB_INTEGRITY_DEADLINE_CEILING_S
+
+
+def test_store_size_comes_from_page_count_and_page_size(tmp_path: Path) -> None:
+    """The budget's input is the header's logical size, not the file's apparent size."""
+    import gateway.lifecycle_ledger as ledger
+    from hermes_cli.sqlite_safe_read import connect_tracked, page_count_bytes
+
+    path = _make_multi_page_state_db(tmp_path, rows=2_000)
+    with connect_tracked(str(path), tracking_path=path) as conn:
+        expected = page_count_bytes(conn)
+
+    assert expected and expected > 0
+    assert ledger._state_db_size_bytes(path) == expected
+    assert ledger.state_db_integrity_deadline_s(path) == ledger.STATE_DB_INTEGRITY_DEADLINE_S
+
+
+def test_deferred_scan_sizes_its_own_deadline_when_none_is_pinned(tmp_path: Path, monkeypatch) -> None:
+    """The gateway must get the derived budget, not the flat constant: `run_bootstrap` passes none."""
+    import gateway.lifecycle_ledger as ledger
+
+    _make_multi_page_state_db(tmp_path, journal_mode="wal")
+    monkeypatch.setattr(ledger, "_state_db_size_bytes", lambda path: _live_store_bytes())
+    seen: dict = {}
+
+    def _spy(**kwargs):
+        seen.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(ledger, "check_state_db_integrity", _spy)
+
+    assert run_deferred_integrity_check({"prior_pid": _DEAD_PID}, home=tmp_path) == "ok"
+    assert seen["deadline_s"] == pytest.approx(
+        _live_store_bytes() / ledger.STATE_DB_INTEGRITY_SCAN_BYTES_PER_S)
+    assert seen["deadline_s"] > ledger.STATE_DB_INTEGRITY_DEADLINE_S
+
+
+def test_deferred_scan_start_does_not_pin_the_flat_deadline(monkeypatch) -> None:
+    """A pinned constant here is what made the size-aware budget dead code."""
+    import gateway.run_bootstrap as boot
+
+    captured: dict = {}
+
+    def _spawn(fn, args=(), kwargs=None, name=None):
+        captured.update({"fn": fn, "args": args, "kwargs": kwargs, "name": name})
+
+        class _Thread:
+            def start(self) -> None:
+                return None
+
+        return _Thread()
+
+    monkeypatch.setattr("agent.memory_provider.spawn_context_thread", _spawn)
+
+    boot._start_deferred_state_db_integrity_check({"prior_pid": _DEAD_PID})
+
+    assert captured["fn"] is run_deferred_integrity_check
+    assert captured["kwargs"] in (None, {}), "the deferred start still pins a deadline"
+    assert not captured["kwargs"] or "deadline_s" not in captured["kwargs"]
+
+
+def test_deadline_abort_logs_a_warning_and_never_the_failure_line(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A cut-off scan must say it was cut off — and must not name the repair remedy."""
+    _make_multi_page_state_db(tmp_path, journal_mode="wal")
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.lifecycle_ledger"):
+        verdict = run_deferred_integrity_check({"prior_pid": _DEAD_PID}, home=tmp_path, deadline_s=0.01)
+
+    assert verdict.startswith("check-incomplete: exceeded"), verdict
+    records = [(r.levelno, r.getMessage()) for r in caplog.records]
+    failures = [m for level, m in records if level >= logging.ERROR and "FAILED integrity check" in m]
+    assert not failures, f"a deadline abort was logged as a failed integrity check: {failures}"
+    aborted = [m for level, m in records if level == logging.WARNING and "ABORTED at its deadline" in m]
+    assert len(aborted) == 1, records
+    assert "NOT evidence of corruption" in aborted[0]
+    assert "hermes doctor" not in aborted[0], "a timeout must not point at the repair remedy"
+    assert "check-incomplete" in aborted[0]
+    assert _exit_diag_records(tmp_path)[-1]["state_db_integrity"] == verdict
+
+
+def test_a_genuinely_damaged_store_still_fails_closed(tmp_path: Path, caplog) -> None:
+    """The corruption path is untouched: a torn page keeps the ERROR and the remedy."""
+    _make_state_db(tmp_path, corrupt=True, journal_mode="wal")
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.lifecycle_ledger"):
+        verdict = run_deferred_integrity_check({"prior_pid": _DEAD_PID}, home=tmp_path, deadline_s=60.0)
+
+    assert verdict not in ("ok", "absent")
+    assert not verdict.startswith("check-"), verdict
+    records = [(r.levelno, r.getMessage()) for r in caplog.records]
+    failures = [m for level, m in records if level >= logging.ERROR and "FAILED integrity check" in m]
+    assert len(failures) == 1, records
+    assert "hermes doctor" in failures[0]
+    assert not [m for m in failures if "NOT evidence of corruption" in m]
+    assert _exit_diag_records(tmp_path)[-1]["state_db_integrity"] == verdict
+
+
+def test_inline_deadline_abort_is_a_warning_too(tmp_path: Path, monkeypatch, caplog) -> None:
+    """Both call sites share one severity decision (`_report_unclean_exit` is not special)."""
+    import gateway.lifecycle_ledger as ledger
+
+    _make_state_db(tmp_path, corrupt=False)
+    _write_sentinel(tmp_path)
+    monkeypatch.setattr(
+        ledger, "check_state_db_integrity", lambda **kwargs: "check-incomplete: exceeded 1800s")
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.lifecycle_ledger"):
+        evidence = record_startup(home=tmp_path, defer_integrity_check=False)
+
+    assert evidence is not None
+    assert evidence["state_db_integrity"] == "check-incomplete: exceeded 1800s"
+    records = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert not [m for level, m in records if level >= logging.ERROR and "FAILED integrity check" in m]
+    assert [m for level, m in records if level == logging.WARNING and "ABORTED at its deadline" in m]
+

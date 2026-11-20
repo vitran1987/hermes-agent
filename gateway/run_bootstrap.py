@@ -18,11 +18,14 @@ def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
     refused. A daemon thread nothing waits on; it only appends the forensic exit-diag record.
     """
     from agent.memory_provider import spawn_context_thread
-    from gateway.lifecycle_ledger import STATE_DB_INTEGRITY_DEADLINE_S, run_deferred_integrity_check
+    from gateway.lifecycle_ledger import run_deferred_integrity_check
+    # No deadline pin: the scan derives its own budget from the store's page count
+    # (STATE_DB_INTEGRITY_DEADLINE_S is only the floor). Passing the flat constant here is what
+    # aborted a 3.66 GB store's scan at 1800 s and logged it as a failed integrity check.
     # Under the caller's profile scope: the scan resolves this gateway's state.db through it.
     spawn_context_thread(
         run_deferred_integrity_check, args=(evidence,),
-        kwargs={"deadline_s": STATE_DB_INTEGRITY_DEADLINE_S}, name="state-db-integrity-check").start()
+        name="state-db-integrity-check").start()
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")

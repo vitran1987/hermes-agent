@@ -7,12 +7,17 @@ import pytest
 from gateway import run_bootstrap
 
 
-def test_scan_runs_on_a_daemon_thread_with_the_1800s_deadline(monkeypatch):
+def test_scan_runs_on_a_daemon_thread_with_no_pinned_deadline(monkeypatch):
+    """The deferred start must NOT pin the flat constant: ``run_deferred_integrity_check`` derives
+    its own budget from the store's ``page_count * page_size`` (the flat 1800 s is only the floor).
+    Pinned here, a 3.66 GB store's scan was aborted at 1800 s and the caller logged the abort as
+    "FAILED integrity check ... Run `hermes doctor`" — 8 such ERRORs on this host, 0 corruptions
+    (measured 2026-11-20). So this test pins the ABSENCE of a pinned deadline."""
     from gateway import lifecycle_ledger as ledger
     seen, release, done = {}, threading.Event(), threading.Event()
 
-    def scan(evidence, *, deadline_s):
-        seen.update(evidence=evidence, deadline_s=deadline_s, thread=threading.current_thread())
+    def scan(evidence, **kwargs):
+        seen.update(evidence=evidence, kwargs=kwargs, thread=threading.current_thread())
         release.wait(5)  # still running when the caller returns: nothing waits on it
         done.set()
     monkeypatch.setattr(ledger, "run_deferred_integrity_check", scan)
@@ -22,7 +27,8 @@ def test_scan_runs_on_a_daemon_thread_with_the_1800s_deadline(monkeypatch):
     assert not done.is_set()
     release.set()
     assert done.wait(5)
-    assert seen["evidence"] is evidence and seen["deadline_s"] == 1800.0
+    assert seen["evidence"] is evidence
+    assert "deadline_s" not in seen["kwargs"], "the deferred start pinned a deadline again"
     assert seen["thread"].daemon and seen["thread"].name == "state-db-integrity-check"
 
 
@@ -75,7 +81,7 @@ def _startup(monkeypatch, tmp_path):
             events.append("scan_launched")
         return real_spawn(target, name=name, **kwargs)
 
-    def scan(evidence, *, deadline_s):
+    def scan(evidence, **kwargs):
         state["scanned"] = evidence
         scan_entered.set()
         release.wait(10)

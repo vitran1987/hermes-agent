@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+from contextlib import closing
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -187,15 +188,112 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
 
 
 # Bound on the deferred post-connect scan: a pathological store cannot pin its thread forever.
-STATE_DB_INTEGRITY_DEADLINE_S = 1800.0
+#
+# The budget follows the STORE, not the clock. ``quick_check`` walks every b-tree page, so its cost
+# is linear in ``page_count * page_size``; one flat bound is therefore only right for the store size
+# it was picked for. Measured on this host 2026-11-20: ``profiles/pm-bangioi/state.db``
+# (page_count 892902 x page_size 4096 = 3.66 GB, journal_mode=wal) did NOT finish
+# ``PRAGMA quick_check(1)`` in 749 s (a 1800 s attempt had already given up), while a sub-GB store
+# finishes in about a second. So 1800 s is a SMALL-store budget. Below the floor nothing changes;
+# above it the budget grows at a deliberately pessimistic 1 MiB/s -- ~5x under the 4.7 MiB/s upper
+# bound the 749 s probe implies for that store, ~9x under the ~4200 s a 37 GB store needs (#115542)
+# -- and the ceiling still stops a pathological store from pinning its thread for a day.
+STATE_DB_INTEGRITY_DEADLINE_S = 1800.0  # floor: a store at or under ~1.7 GiB keeps today's budget
+STATE_DB_INTEGRITY_DEADLINE_CEILING_S = 14_400.0  # cap: 4 h, ~14 GiB at the assumed rate
+STATE_DB_INTEGRITY_SCAN_BYTES_PER_S = 1_048_576.0  # assumed throughput (1 MiB/s, cold + live writes)
+# The deadline abort's verdict prefix. It says the scan STOPPED, never that the file is damaged.
+STATE_DB_INTEGRITY_INCOMPLETE_PREFIX = "check-incomplete:"
+
+
+def _integrity_deadline_for_bytes(nbytes: Optional[int]) -> float:
+    """Scan budget for a store of *nbytes*: ``nbytes / assumed_rate`` clamped to the
+    ``[floor, ceiling]`` pair above; the floor whenever the size is unknown or non-positive, which is
+    exactly today's behaviour for a store that cannot be sized."""
+    if not nbytes or nbytes <= 0:
+        return STATE_DB_INTEGRITY_DEADLINE_S
+    budget = nbytes / STATE_DB_INTEGRITY_SCAN_BYTES_PER_S
+    return max(STATE_DB_INTEGRITY_DEADLINE_S, min(budget, STATE_DB_INTEGRITY_DEADLINE_CEILING_S))
+
+
+def _state_db_size_bytes(path: Optional[Path]) -> Optional[int]:
+    """Logical size of the store in bytes (``page_count * page_size``) plus its ``-wal`` sidecar,
+    read over one short-lived tracked connection so no lock outlives the read. The sidecar counts
+    because a WAL scan reads its committed snapshot through the WAL. ``None`` when unsizable.
+    Never raises."""
+    if path is None or not path.exists():
+        return None
+    try:
+        from hermes_cli.sqlite_safe_read import connect_tracked, page_count_bytes
+
+        with closing(connect_tracked(str(path), timeout=1.0, tracking_path=path)) as conn:
+            logical = page_count_bytes(conn)
+    except Exception:
+        logger.debug("Could not size state.db for the integrity-check budget", exc_info=True)
+        return None
+    if not logical or logical <= 0:
+        return None
+    wal = Path(f"{path}-wal")
+    try:
+        if wal.exists():
+            logical += wal.stat().st_size
+    except OSError:
+        pass
+    return int(logical)
+
+
+def state_db_integrity_deadline_s(path: Optional[Path] = None, *, home: Optional[Path] = None) -> float:
+    """The deadline this store's scan deserves today. ``path`` may be passed when the caller
+    already resolved the store; otherwise it is resolved from the profile scope. An unresolvable or
+    unsizable store keeps :data:`STATE_DB_INTEGRITY_DEADLINE_S`. Never raises."""
+    if path is None:
+        try:
+            from persistence_assembly import profile_scope, store_location
+
+            path = store_location(profile_scope(home=_home_path(home)))
+        except Exception:
+            logger.debug("Could not resolve state.db for the integrity-check budget", exc_info=True)
+            return STATE_DB_INTEGRITY_DEADLINE_S
+    return _integrity_deadline_for_bytes(_state_db_size_bytes(path))
+
+
+def _log_integrity_verdict(verdict: str) -> None:
+    """One verdict, one log line at the severity it earns.
+
+    Three outcomes must not share a line: ``ok``/``absent``/``skipped:`` (already reported where
+    they are produced), the DEADLINE abort, and a real sqlite complaint. A ``check-incomplete:``
+    verdict means the scan was cut off mid-walk -- the file was never judged, so it is a WARNING
+    that says so, and it must NOT carry the repair remedy: ``hermes doctor`` cannot make a scan
+    finish, and reporting it as ``FAILED ... Run hermes doctor`` manufactured 8 false corruption
+    reports on this host (2026-11-20) from a bound that a 3.66 GB store cannot meet. A genuine
+    non-``ok`` verdict keeps the fail-closed ERROR below, unchanged.
+    """
+    if verdict in ("ok", "absent") or verdict.startswith("skipped:"):
+        return
+    if verdict.startswith(STATE_DB_INTEGRITY_INCOMPLETE_PREFIX):
+        logger.warning(
+            "state.db integrity scan was ABORTED at its deadline after an unclean gateway exit: %s — the "
+            "scan did not finish, so the file was never judged and this is NOT evidence of corruption; "
+            "nothing needs repairing (a later unclean boot re-checks it). A genuinely damaged store still "
+            "fails with sqlite's own complaint instead of this line.",
+            verdict,
+        )
+        return
+    logger.error(
+        "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+        "missing until it is repaired. Run `hermes doctor`.",
+        verdict,
+    )
+
 
 
 def check_state_db_integrity(home: Optional[Path] = None, *, deadline_s: Optional[float] = None) -> str:
     """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
 
     Only after an unclean death — SIGKILL mid-WAL-checkpoint can leave half-written
-    b-tree pages.  ``quick_check(1)`` stops at the first problem (~2s on a healthy
-    500MB store): cheap once per unclean boot, too costly every boot.  Opened
+    b-tree pages.  ``quick_check(1)`` stops at the first problem: about a second on a
+    sub-GB store, but NOT the ~2s-per-500MB the old docstring assumed — a 3.66 GB store
+    had not finished in 749 s (measured 2026-11-20), which is why the budget callers pass
+    is derived from the store's size rather than from this estimate.  Opened
     normally: a WAL store needs its -shm sidecar for read-only, and the PRAGMA writes nothing.
 
     Holds a phase-owned startup-watchdog lease for the check duration
@@ -247,12 +345,7 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
     else:
         # The death may have torn the store; this is the only moment we know to look.
         verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-        if verdict not in ("ok", "absent"):
-            logger.error(
-                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-                "missing until it is repaired. Run `hermes doctor`.",
-                verdict,
-            )
+        _log_integrity_verdict(verdict)
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
@@ -306,7 +399,7 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
 
 def run_deferred_integrity_check(
     evidence: Optional[dict[str, Any]], *, home: Optional[Path] = None,
-    deadline_s: float = STATE_DB_INTEGRITY_DEADLINE_S,
+    deadline_s: Optional[float] = None,
 ) -> str:
     """Run the deferred post-connect state.db scan and append a second diag record.
 
@@ -314,12 +407,16 @@ def run_deferred_integrity_check(
     is moved off the startup path (where, on a multi-GB store, it gated every platform adapter
     — including the ``:8644`` fleet peer-DM transport — for minutes) into a daemon thread
     started only after platforms connected.  ``deadline_s`` bounds a pathological store so the
-    thread cannot be pinned forever.
+    thread cannot be pinned forever: ``None`` (the default) derives the budget from this store's
+    ``page_count * page_size`` via :func:`state_db_integrity_deadline_s`, an explicit number pins
+    it, and ``math.inf`` restores the historic unbounded scan.
 
     Appends ``{"tag": "gateway.state_db_integrity", "deferred": true, "state_db_integrity":
-    <verdict>, "prior_pid": ...}`` and logs the existing ERROR text on a bad verdict.  NEVER
-    raises -- a forensic scan must not disturb a running gateway (the alerting path is the
-    bounded per-poll readiness probe ``gateway/readiness.py::_probe_state_db``).
+    <verdict>, "prior_pid": ...}`` and logs the verdict at the severity it earns
+    (:func:`_log_integrity_verdict`: a deadline abort is a WARNING with no repair remedy, a real
+    sqlite complaint the fail-closed ERROR).  NEVER raises -- a forensic scan must not disturb a
+    running gateway (the alerting path is the bounded per-poll readiness probe
+    ``gateway/readiness.py::_probe_state_db``).
 
     Only a WAL store is scanned: in rollback-journal mode (``database.journal_mode: delete``,
     or a silent WAL fallback) the scan's SHARED lock would block every live commit for its
@@ -341,13 +438,9 @@ def run_deferred_integrity_check(
                 path, mode or "unknown", path,
             )
         else:
-            verdict = check_state_db_integrity(home=home, deadline_s=deadline_s)
-        if verdict not in ("ok", "absent") and not verdict.startswith("skipped:"):
-            logger.error(
-                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-                "missing until it is repaired. Run `hermes doctor`.",
-                verdict,
-            )
+            budget = state_db_integrity_deadline_s(path) if deadline_s is None else deadline_s
+            verdict = check_state_db_integrity(home=home, deadline_s=budget)
+        _log_integrity_verdict(verdict)
         record: dict[str, Any] = {
             "ts": _now_iso(),
             "tag": "gateway.state_db_integrity",

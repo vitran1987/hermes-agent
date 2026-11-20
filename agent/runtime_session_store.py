@@ -17,8 +17,18 @@ import queue
 import sys
 import threading
 from hermes_dir_acl import make_user_dir
+from hermes_state_errors import WorkerReceiptTimeout, is_worker_receipt_timeout
 
 logger = logging.getLogger(__name__)
+
+#: How long a worker waits for a ``worker.persist`` receipt before calling its owner unresponsive.
+#: It MUST outlive the owner's own write patience — ``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``
+#: (60 s), which ``apply_worker_receipt`` uses — or a slow-but-alive owner can never answer in
+#: time. When this was a hard-coded 20 s, the owner's row landed 12-18 s AFTER the worker had
+#: given up (463 ``worker_receipt_timeout`` events on one profile in one day), and every one of
+#: them killed a turn whose write had actually succeeded. A test asserts the invariant against the
+#: owner's constants so raising either side cannot silently re-open the gap.
+_RECEIPT_BUDGET_S = 90.0
 
 _worker_process = False
 
@@ -109,7 +119,7 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            raise WorkerReceiptTimeout('worker_receipt_timeout') from None
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -194,7 +204,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(_RECEIPT_BUDGET_S)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -317,7 +327,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:
-                raise WorkerPersistenceError('pending_receipt')
+                # An entry is journalled BEFORE it is sent and an exact re-send resolves to its
+                # ORIGINAL receipt, so replaying it is idempotent (same ``sequence``, no duplicate).
+                # Refusing with ``pending_receipt`` turned one late ACK into a dead session.
+                self.retry_pending()
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
@@ -344,7 +357,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
-                self.failure = str(exc)
+                # A lost receipt is not a durable failure: the owner may have applied the write and
+                # lost only the ACK, so leave ``failure`` clear and let the next persist replay this
+                # same entry. Latching it here failed every later persist in the process instantly.
+                self.failure = None if is_worker_receipt_timeout(exc) else str(exc)
                 raise
             self.failure = None
             return results

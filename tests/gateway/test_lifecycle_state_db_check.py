@@ -532,4 +532,3 @@ def test_inline_deadline_abort_is_a_warning_too(tmp_path: Path, monkeypatch, cap
     records = [(r.levelno, r.getMessage()) for r in caplog.records]
     assert not [m for level, m in records if level >= logging.ERROR and "FAILED integrity check" in m]
     assert [m for level, m in records if level == logging.WARNING and "ABORTED at its deadline" in m]
-

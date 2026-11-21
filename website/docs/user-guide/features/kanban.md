@@ -960,7 +960,7 @@ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
-hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+hermes kanban schedule <id> ["<reason>"]                # park in 'scheduled' until an explicit unblock
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
@@ -1023,14 +1023,11 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
-### Scheduled task starts (`scheduled_at`)
+### Time-based starts do not exist — `scheduled` is a manual lane
 
-Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
+There is no `--at` flag, no `scheduled_at` column, and no `--scheduled-at` on `create`: the `tasks` table stores no start timestamp and the dispatcher never reads one, so a card cannot be told to wake at a chosen time. What `hermes kanban schedule <id> "<reason>"` does is park the card in `scheduled` — a lane the dispatcher does not claim, so time-delay/follow-up work is not shown as a human blocker — record the reason as a `SCHEDULED:` comment, and leave the card there until `hermes kanban unblock <id>` re-gates it.
 
-```bash
-hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
-```
+For a start at a chosen time, gate it from outside the board: a `hermes cron` job or an OS scheduler that runs `hermes kanban unblock <id>`. Do not plan around a timestamped flag — the card will not wake at the time you name, and the flag does not exist to begin with.
 
 ### Respawn guard
 

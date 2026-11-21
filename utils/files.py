@@ -362,7 +362,11 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
                   preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False) -> None:
     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
 
-    *write(f)* emits the payload into the open handle (text, or bytes when *binary*). The temp file
+    *write(f)* emits the payload into the open handle (text, or bytes when *binary*). A text handle
+    is opened with ``newline=""``: the payload is written **verbatim**, never translated to
+    ``os.linesep``. The default translation silently rewrote every config/YAML/JSON/state file as
+    CRLF on Windows — whatever the caller wrote and whatever the checkout's ``* text eol=lf`` pin
+    said — and turned a payload that already held ``"\\r\\n"`` into ``"\\r\\r\\n"``. The temp file
     is created by ``mkstemp`` — ``O_CREAT|O_EXCL`` at 0600 regardless of umask — so a secret is
     never readable at process umask, not even between create and chmod. *mode* is fchmod'd onto
     the temp fd BEFORE the replace so the target never transits through mkstemp's 0600 (fchmod is
@@ -385,7 +389,9 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     original_owner = preserve_file_owner(path) if preserve_owner else None
     fd, tmp_path = mkstemp_beside(path, prefix=prefix, suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else encoding) as f:
+        # Verbatim text: see the docstring — translation is the bug, not a feature.
+        with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else encoding,
+                       newline=None if binary else "") as f:
             if mode is not None and hasattr(os, "fchmod"):
                 os.fchmod(f.fileno(), mode)
             write(f)

@@ -361,7 +361,13 @@ def mint_launcher(
         "@echo off\r\n"
         f'"{python_exe}" -I -c "{code}" %*\r\n'
     )
-    return _write_atomic(out_dir / f"{name}.cmd", lambda p: p.write_text(body, encoding="utf-8"))
+    # ``newline=""`` writes the payload verbatim. Under the default
+    # ``newline=None`` the text layer translates every "\n" above to
+    # ``os.linesep``, so on Windows the CRLF spelled out here landed on disk as
+    # ``"\r\r\n"`` in every minted .cmd (the same doubling class as
+    # ``hermes_cli/profiles.py`` and ``utils/files.py::_atomic_write``).
+    return _write_atomic(out_dir / f"{name}.cmd",
+                         lambda p: p.write_text(body, encoding="utf-8", newline=""))
 
 
 # A killed move can tear the repair's own code (``hermes_bootstrap``, ``hermes_cli``). With the
@@ -714,9 +720,11 @@ def _launcher_python(target: Path) -> Path | None:
             return None
         lines = text.splitlines()
         if suffix == ".cmd":
-            # "@echo off", then '"<python>" -I -c "<code>" %*'. The file's
-            # own \r\n pair gains a translated extra \r on Windows writes,
-            # so the command may sit past a blank line — never assume its index.
+            # "@echo off", then '"<python>" -I -c "<code>" %*' — one line each.
+            # A launcher written before the writer spelled its CRLFs verbatim
+            # holds "\r\r\n" instead, which ``splitlines`` reads as an empty
+            # line, so take the first non-blank entry rather than index the
+            # command: both shapes are on disk and both must parse.
             line = next((entry for entry in lines[1:] if entry.strip()), None)
             if line is None:
                 return None

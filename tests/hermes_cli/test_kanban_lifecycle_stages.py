@@ -203,6 +203,47 @@ def test_active_pr_guard_is_lifted_by_the_stage_handoff(home):
         assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
 
 
+def test_active_pr_guard_tie_with_the_pr_comment_still_lifts(home):
+    """A stage handoff in the SAME second as the PR comment must not park the card.
+
+    Measured before this rule on a real PR: the review->merge advance landed at the
+    comment's second, so the strictly-after comparison never saw it and the merge
+    stage stayed guarded on every later tick.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tie card", assignee="developer-bangioi")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb.add_comment(conn, tid, author="worker", body=f"PR opened: {PR_URL}")
+        comment_time = conn.execute(
+            "SELECT created_at FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'stage_advanced', ?, ?)",
+                (tid, json.dumps({"from": "sec", "to": "merge",
+                                  "assignee": "code-reviewer-bangioi"}), comment_time),
+            )
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
+
+
+def test_stage_advanced_without_a_target_is_not_a_handoff(home):
+    """A malformed stage_advanced (no ``to``) must not lift the guard."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="junk card", assignee="developer-bangioi")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        kb.add_comment(conn, tid, author="worker", body=f"PR opened: {PR_URL}")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'stage_advanced', ?, ?)",
+                (tid, json.dumps({"from": "sec"}), int(time.time()) + 5),
+            )
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == "active_pr"
+
+
 def test_sec_is_skipped_for_a_docs_only_pr_and_the_reason_is_recorded(
     home, spawned, acceptance_ok, all_assignees_spawnable, monkeypatch,
 ):
@@ -334,9 +375,18 @@ def test_changes_requested_sends_the_card_back_to_implement(
         run_id = _task(conn, tid).current_run_id
         ok, implementer = kb.request_changes(conn, tid, reason="needs tests", expected_run_id=run_id)
         assert ok and implementer == "developer-bangioi"
-        assert kbl.run_phase(conn) == []  # nothing to advance: the card is back at implement
+        # The dispatcher records the stage hop back (once), so the audit trail is
+        # not silent about review -> implement.
+        moved = kbl.run_phase(conn)
+        assert moved and (moved[0]["from"], moved[0]["to"]) == ("review", "implement")
+        assert kbl.run_phase(conn) == []  # idempotent: one record per rejection
         task = _task(conn, tid)
         assert (task.status, task.assignee) == ("ready", "developer-bangioi")
+        assert _advances(conn, tid)[-1] == ("review", "implement")
+        # ... and the card can be re-reviewed: the second handoff still advances.
+        assert kb.request_review(conn, tid, summary="v2")
+        kbd.dispatch_once(conn, spawn_fn=fake)
+        assert _advances(conn, tid)[-1] == ("implement", "review")
 
 
 def test_lifecycle_contract_validation():

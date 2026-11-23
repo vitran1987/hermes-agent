@@ -53,6 +53,7 @@ DIFFS = {
     A_PR: [".github/workflows/ci-pr.yml", "hermes/scripts/x.ps1"],
     B_PR: ["docs/hermes-downstream-delta.md"],
 }
+REAL_CHANGED_PATHS = kbl.changed_paths          # kept for the real-gh section below
 kbl.changed_paths = lambda url, assignee=None: DIFFS[url]
 
 CONTRACT = {
@@ -116,6 +117,38 @@ def run_card(conn, title, pr):
     return tid
 
 
+def run_rejection_cycle(conn, title, pr):
+    """implement -> review --request_changes--> implement -> review -> sec -> merge."""
+    contract = dict(CONTRACT, pr=pr)
+    tid = kb.create_task(conn, title=title, assignee="developer-bangioi",
+                         completion_contract=json.dumps(contract))
+    print(f"\n--- {title} ---")
+    kbd.dispatch_once(conn, spawn_fn=spawn)                      # implement
+    assert kb.request_review(conn, tid, summary="implemented v1")
+    r = kbd.dispatch_once(conn, spawn_fn=spawn)                  # -> review
+    print(f"tick 2: advanced={[(m.get('from'), m.get('to')) for m in r.lifecycle_advanced]}")
+    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    ok, implementer = kb.request_changes(conn, tid, reason="needs tests", expected_run_id=run_id)
+    print(f"reviewer request_changes -> ok={ok} implementer={implementer} "
+          f"advanced_now={kbl.run_phase(conn)}")                  # no move: back at implement
+    print(f"  state after rejection: "
+          f"{dict(conn.execute('SELECT status, assignee FROM tasks WHERE id = ?', (tid,)).fetchone())}")
+    assert kb.request_review(conn, tid, summary="implemented v2")
+    r = kbd.dispatch_once(conn, spawn_fn=spawn)                  # implement -> review again
+    print(f"tick 3 (re-entry): advanced={[(m.get('from'), m.get('to')) for m in r.lifecycle_advanced]}")
+    assert kb.complete_task(conn, tid, summary="review approved")
+    for n in (4, 5, 6):
+        r = kbd.dispatch_once(conn, spawn_fn=spawn)
+        if r.lifecycle_advanced:
+            print(f"tick {n}: advanced={[(m.get('from'), m.get('to') or m.get('completed')) for m in r.lifecycle_advanced]}")
+        status = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        if status == "done":
+            break
+        assert kb.complete_task(conn, tid, summary=f"stage verdict #{n}")
+    show(conn, tid, title)
+    return tid
+
+
 kb.init_db()
 with kbc.connect() as conn:
     a = run_card(conn, "A: PR touches .github/workflows", A_PR)
@@ -136,6 +169,26 @@ with kbc.connect() as conn:
     after = [r2["kind"] for r2 in conn.execute(
         "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (plain,))]
     print(f"  lifecycle_advanced={r.lifecycle_advanced} new_events={after[len(before):]}")
+    c = run_rejection_cycle(conn, "C: reviewer request_changes then re-entry", A_PR)
+
+# --- REAL GitHub reads: sec_required_if against two real PRs ------------------
+# The stage chain above stubs the diff reader for determinism; these two reads are
+# real gh API calls (no stub, no fixture), one PR that touches a workflow and one
+# that does not.
+REAL_PRS = [
+    ("PR that touches .github/workflows", "Cong-ty-TNHH-Ban-Gioi/bangioi", 19197),
+    ("PR that does not", "vitran1987/hermes-agent", 37),
+]
+print("\n== sec_required_if vs REAL PR diffs (real gh api, ambient login) ==")
+for label, repo, number in REAL_PRS:
+    url = f"https://github.com/{repo}/pull/{number}"
+    paths = REAL_CHANGED_PATHS(url, assignee=None)
+    if paths is None:
+        print(f"  {label}: {url} -> file list UNREADABLE (sec would stay required)")
+        continue
+    required, hits = kbl.sec_required(paths, CONTRACT["sec_required_if"])
+    print(f"  {label}: {url} -> {len(paths)} files, sec_required={required}, matched={hits[:3]}")
+    print(f"    files: {paths[:6]}{' ...' if len(paths) > 6 else ''}")
 
 # --- the real board: no lifecycle cards, so the phase is a no-op there --------
 import sqlite3

@@ -184,8 +184,9 @@ def bind_worker_context(frame):
                     or task.claim_lock != context['claim_lock']):
                 raise RuntimeStoreError('stale_kanban_claim')
             # The dispatcher's spawned worker stays the run's pid (reclaim, timeout and operator
-            # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
-            # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
+            # kills target it; ``_watch_submitter`` books this attempt's loss when it goes away,
+            # without touching this shared interpreter). The bound interpreter is recorded beside
+            # it so a sweep can tell when the attempt is truly gone.
             from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
             fingerprint = _process_fingerprint(os.getpid()) or UNVERIFIED_WORKER_FINGERPRINT
             kb._append_event(conn, task.id, 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
@@ -208,7 +209,11 @@ _TURNS_DONE = threading.Event()
 def _watch_submitter(db, run_id):
     """The dispatcher's spawned worker is this attempt's handle: killing it (an operator, a
     timeout, an OOM kill) must end the attempt, as it did when the worker ran the agent itself.
-    Exiting hard leaves no ``worker_result``, so the dead-worker sweep books this run's crash.
+
+    It ends THIS attempt only. The worker is a separate process while the bound interpreter is a
+    gateway serving every other card, so the watcher records the run's loss and stops -- it never
+    takes the interpreter down with it. No ``worker_result`` is written, so the dead-worker sweep
+    still books this run's crash exactly as it did when the process died.
     The run row is re-read each tick: the dispatcher records the pid only after its spawn returns."""
     import os
     from hermes_cli.kanban_db_dispatch import _worker_alive
@@ -217,11 +222,17 @@ def _watch_submitter(db, run_id):
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
             while not _TURNS_DONE.wait(1.0):
                 try:
-                    row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
+                    row = conn.execute('SELECT worker_pid, worker_started_at, task_id, claim_lock FROM task_runs WHERE id=?', (run_id,)).fetchone()
                 except sqlite3.Error:
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
-                    os._exit(1)
+                    # One worker finishing (or dying) is not a reason to kill the gateway: record
+                    # the attempt's loss and let the sweep book the crash. Exiting here cost a
+                    # whole wave of unrelated cards every time a worker went away.
+                    _record_worker_loss({'db': str(db), 'run_id': run_id,
+                                         'task_id': row[2], 'claim_lock': row[3]},
+                                        'submitter_worker_gone', pid=row[0])
+                    return
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
 
 
@@ -322,6 +333,19 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
         context = json.loads(policy.kanban_json or 'null')
         if not context:
             return
+        _record_worker_loss(context, reason, pid=pid, bound=bound)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('kanban worker_lost record failed')
+
+
+def _record_worker_loss(context, reason, *, pid=None, bound=False):
+    """``record_worker_loss`` for a caller that already holds the decoded policy context.
+
+    Never raises: a watcher or a loss handler must reach its own next step even when the board
+    write fails.
+    """
+    try:
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli import kanban_db as kb
         run_id = int(context['run_id'])

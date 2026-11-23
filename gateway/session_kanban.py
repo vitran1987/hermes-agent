@@ -362,9 +362,16 @@ def _bound_claim_is_live(context):
         return False
 
 
-def worker_result(path, params):
-    """Read only the dispatcher's exact attempt; never infer success from admission settlement."""
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+def worker_result(path, params, busy_timeout=None):
+    """Read only the dispatcher's exact attempt; never infer success from admission settlement.
+
+    ``busy_timeout`` widens the connection's lock wait: a reconciling worker (a receipt the owner
+    reported ``unknown``) re-reads under the same board contention that lost the owner's write.
+    """
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True,
+                                 timeout=busy_timeout)) as conn:
+        if busy_timeout:
+            conn.execute(f'PRAGMA busy_timeout = {int(busy_timeout * 1000)}')
         row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
             (params['run_id'], params['task_id'])).fetchone()
         result = json.loads(row[0]) if row else {}

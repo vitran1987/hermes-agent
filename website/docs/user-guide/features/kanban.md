@@ -1053,7 +1053,55 @@ The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 err
 
 To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
 
-`recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+`recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, a review reopen, or the dispatcher's own `stage_advanced` for a [declared lifecycle](#one-card-lifecycle-declared-stages) — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+
+### One-card lifecycle (declared stages)
+
+A card can declare its whole stage chain once and let the dispatcher walk it — no
+operator reassignment between stages, and **no child card per stage**:
+
+```json
+{
+  "lifecycle": "full",
+  "stages": ["implement", "review", "sec", "merge"],
+  "sec_required_if": [".github/workflows/**", ".github/actions/**", "**/secrets/**", "supabase/migrations/**"],
+  "assignees": {"review": "code-reviewer-bangioi", "sec": "security-reviewer-bangioi", "merge": "code-reviewer-bangioi"},
+  "pr": "https://github.com/OWNER/REPO/pull/123"
+}
+```
+
+Pass that JSON as the card's `completion_contract` (`hermes kanban create --completion-contract '<json>'`,
+or `completion_contract=` on the `kanban_create` tool). `stages` must start at
+`implement`; `pr` is required because the exact-head acceptance gate and the
+security diff read the same PR.
+
+How it moves:
+
+* **implement** (`ready` lane, the card's own assignee) ends when the worker hands
+  off with `kanban_request_review`. The dispatcher then writes
+  `stage_advanced {from: implement, to: review}` and puts the card on the review
+  stage's profile.
+* **review** and **sec** run in the `review` lane: the stage owner approves with
+  `kanban_complete` and rejects with `kanban_request_changes` (which lands the card
+  back on the implementer — the stage resets to `implement`).
+* **sec** is inserted only when one of the PR's changed files matches
+  `sec_required_if` (globs, matched case-sensitively against repo-relative paths).
+  The decision and its reason ride the `stage_advanced` payload as `sec_decision`;
+  an unreadable PR file list keeps `sec` in the chain rather than assuming a clean
+  diff. A `sec` stage declared without `sec_required_if` uses the built-in
+  sensitive-path set.
+* **merge** runs in the `ready` lane; the profile merges the PR and completes.
+  The declared `pr` makes that completion run the exact-head acceptance gate, and
+  the dispatcher records `lifecycle_completed` — the card stays `done`.
+
+The chain is derived from the event log, never from a side table: the newest
+`stage_advanced` (or `changes_requested`) names the current stage, so a re-queued
+or reopened card resumes where it is. A stage that cannot proceed is reported
+instead of guessed — an `implement` stage that completes without a review handoff,
+or a stage with no resolvable assignee, emits `lifecycle_deviation` and leaves the
+card for a human. Default stage profiles can be set board-wide with
+`kanban.lifecycle_assignees` (`{review: ..., sec: ..., merge: ...}` or
+`"review=a,merge=b"`).
 
 ### Drag-to-delete and bulk delete (dashboard)
 
@@ -1453,6 +1501,9 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for orchestration attention, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
+| `stage_advanced` | `{from, to, stage_index, stages, assignee, lane, reason, source, sec_decision?, implementer?}` | The dispatcher moved a card with a [declared lifecycle](#one-card-lifecycle-declared-stages) to its next stage, on the SAME card: it re-points the assignee (and re-opens a `done` card into the next stage's lane). `source` is `dispatcher`; `sec_decision` carries the `sec_required_if` verdict and its reason. This is a handoff for the `active_pr` guard, exactly like an operator reassign. |
+| `lifecycle_completed` | `{stage, stages, status}` | The last declared stage ended: the chain is finished and the card stays `done`. |
+| `lifecycle_deviation` | `{stage, reason, expected, action}` | The chain cannot move on its own (an `implement` stage that completed without a review handoff, or a stage with no resolvable assignee). Nothing is guessed; the card waits for a human. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
 
 **Edits** (human-driven changes that aren't transitions):

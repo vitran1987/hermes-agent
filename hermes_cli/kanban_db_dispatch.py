@@ -174,6 +174,11 @@ class DispatchResult:
     line (``spawn_error=1 (t_x: RuntimeError: ...)``) and keeps a tick that also
     carries a cap/guard hold classified as stuck, so a broken profile can never
     hide behind a busy one."""
+    lifecycle_advanced: list[dict] = field(default_factory=list)
+    """One-card lifecycle moves this tick (``{"task", "from", "to", "assignee",
+    "status"}``), or the planned moves under ``dry_run``. A declared multi-stage
+    card advances its own assignee between stages
+    (``hermes_cli.kanban_lifecycle``); empty on a board with no lifecycle cards."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -1922,9 +1927,14 @@ def check_respawn_guard(
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
+        # ``stage_advanced`` is the DISPATCHER's own one-card lifecycle handoff
+        # (implement -> review -> sec -> merge): it names the profile that must
+        # work on that PR next, exactly like an operator reassign, and the
+        # implementer cannot write it -- so it lifts the guard.
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'stage_advanced')",
+                cols=", kind, payload", strict=True)):
             return None
         return "active_pr"
 
@@ -1955,7 +1965,15 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     --reclaim``), an unassign, or the dispatcher's own
     ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
     the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
+    before it was recorded) are not trusted as handoffs — fail closed.
+
+    Every OTHER kind reaching this function is already a dispatcher/reviewer
+    produced handoff: ``changes_requested`` and ``review_reopened`` route the
+    card back to a named profile, and ``stage_advanced`` is the one-card
+    lifecycle move (``hermes_cli.kanban_lifecycle``) that hands the SAME card to
+    the next stage's owner. A worker cannot write any of them, so they lift the
+    guard instead of parking the card.
+    """
     if kind != "assigned":
         return True
     data = _kb._json_or(payload, {})
@@ -2659,6 +2677,12 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # One-card lifecycle: a card that declared ``stages`` moves its own assignee
+    # between stages here, BEFORE the spawn budget is computed, so the card it
+    # just handed on can be claimed in this same tick. No operator reassign and
+    # no per-stage child card is involved.
+    from hermes_cli import kanban_lifecycle as _lifecycle
+    result.lifecycle_advanced = _lifecycle.run_phase(conn, dry_run=dry_run)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

@@ -7,6 +7,13 @@ receipts only after rechecking the captured run/status/contract under its lock.
 login: :func:`_gh_env` resolves that profile's own credentials/config for the
 subprocess — a multi-profile host's default ``gh`` login cannot read another
 org's private repos (#122689).
+
+"Done" is not "the PR's checks are green" (CEO directive 2026-11-24): a card may
+close only when its PR is **MERGED** *and* the merge commit itself carries the
+CI Full run and the staging deploy. A PR left OPEN cannot pass any more, and the
+post-merge evidence is read at run/job/commit-status level — a workflow-level
+``conclusion`` is not evidence on its own (a run whose jobs were all skipped
+still reports ``success``).
 """
 from __future__ import annotations
 
@@ -18,6 +25,24 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+
+# Post-merge pipeline evidence (CEO directive 2026-11-24). The names are the BanGioi
+# pipeline's; a repository that runs a differently named one overrides them under
+# ``kanban.acceptance`` in config.yaml. A name the repository does not carry is recorded
+# as ``not_applicable`` in the receipt — the gate never invents a pipeline, and never
+# reports a missing one as green.
+_ACCEPTANCE_DEFAULTS = {
+    "ci_workflow": "CI Full",
+    "deploy_workflow_prefix": "Deploy Staging",
+    "deploy_status_context": "deploy/staging",
+}
+
+
+def _policy() -> dict:
+    from hermes_cli.config import load_config
+    policy = dict(_ACCEPTANCE_DEFAULTS)
+    policy.update(((load_config() or {}).get("kanban") or {}).get("acceptance") or {})
+    return policy
 
 
 def validate_contract(value: str | None) -> str:
@@ -90,6 +115,123 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
     return env
 
 
+def _is_merged(pr: dict) -> bool:
+    """Merged means the change reached the base branch, not merely that the PR is green.
+
+    GraphQL reports a merged PR as ``state: MERGED``; ``CLOSED`` + ``merged`` covers a
+    read taken around a branch deletion. An OPEN PR is never merged, however green."""
+    return pr.get("state") == "MERGED" or (pr.get("state") == "CLOSED" and pr.get("merged") is True)
+
+
+def _pages(value) -> list:
+    """``gh api --paginate --slurp`` returns one element per page; a plain read returns the object."""
+    return value if isinstance(value, list) else [value]
+
+
+def _workflow_names(repo: str, profile_home: str | None) -> set[str]:
+    pages = _api(f"repos/{repo}/actions/workflows?per_page=100", paginate=True, profile_home=profile_home)
+    return {w["name"] for page in _pages(pages)
+            for w in (page or {}).get("workflows") or [] if w.get("name")}
+
+
+def _workflow_evidence(repo: str, workflow: str, sha: str, profile_home: str | None) -> dict:
+    """Newest run of ``workflow`` at ``sha`` — read at JOB level, not at conclusion level.
+
+    Measured 2026-11-24: a run whose jobs were all ``skipped`` still reports
+    ``conclusion: success``, so the conclusion alone would green-light a merge whose CI
+    never executed. A completed run only counts when at least one job succeeded and no
+    job failed.
+    """
+    pages = _api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100",
+                 paginate=True, profile_home=profile_home)
+    runs = [r for page in _pages(pages) for r in (page or {}).get("workflow_runs") or []
+            if r.get("name") == workflow and r.get("head_sha") == sha]
+    if not runs:
+        return {"state": "missing", "detail": f"no {workflow!r} run exists at the merge commit"}
+    run = max(runs, key=lambda r: (r.get("created_at") or "", r.get("id") or 0))
+    evidence = {"state": "pending", "run_id": run.get("id"), "url": run.get("html_url"),
+                "status": run.get("status"), "conclusion": run.get("conclusion")}
+    if run.get("status") != "completed":
+        return evidence
+    if run.get("conclusion") != "success":
+        return {**evidence, "state": "failure"}
+    pages = _api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100",
+                 paginate=True, profile_home=profile_home)
+    conclusions = [j.get("conclusion") for page in _pages(pages) for j in (page or {}).get("jobs") or []]
+    evidence["jobs"] = {"total": len(conclusions),
+                        "success": conclusions.count("success"),
+                        "failed": sum(1 for c in conclusions if c in {"failure", "cancelled", "timed_out"})}
+    if evidence["jobs"]["success"] and not evidence["jobs"]["failed"]:
+        return {**evidence, "state": "success"}
+    return {**evidence, "state": "missing",
+            "detail": f"{workflow} concluded success but no job succeeded (all skipped)"}
+
+
+def _staging_status(repo: str, sha: str, context: str, profile_home: str | None) -> dict | None:
+    pages = _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+                 paginate=True, profile_home=profile_home)
+    records = [s for page in _pages(pages) for s in (page if isinstance(page, list) else [page])]
+    statuses = [s for s in records if isinstance(s, dict) and s.get("context") == context]
+    return max(statuses, key=lambda s: s.get("id") or 0) if statuses else None
+
+
+def _staging_evidence(repo: str, branch: str, merge_sha: str, context: str,
+                      profile_home: str | None) -> dict:
+    """The staging deploy of the merge commit, read from the pipeline's own commit status.
+
+    ``deploy/staging`` is written by the deploy job on success and by the failure-notify
+    job on any failure (deploy OR smoke test), so its newest state is a job-level receipt.
+    A later base-branch tip that CONTAINS the merge commit is accepted too: the staging
+    concurrency group is latest-wins, so a cancelled run can leave the merge commit at
+    ``pending`` while a descendant tip carries the terminal result for the same tree.
+    """
+    status = _staging_status(repo, merge_sha, context, profile_home)
+    evidence = {"sha": merge_sha}
+    if not (status and status.get("state") == "success"):
+        tip = _api(f"repos/{repo}/git/ref/heads/{quote(branch, safe='')}",
+                   profile_home=profile_home)["object"]["sha"]
+        if tip and tip != merge_sha:
+            compare = _api(f"repos/{repo}/compare/{merge_sha}...{tip}", profile_home=profile_home)
+            if compare.get("status") in {"ahead", "identical"}:
+                tip_status = _staging_status(repo, tip, context, profile_home)
+                if tip_status and tip_status.get("state") == "success":
+                    status, evidence = tip_status, {"sha": tip, "contains_merge_commit": True}
+    if status is None:
+        return {**evidence, "state": "missing",
+                "detail": f"no {context!r} status on the merge commit or on {branch!r}"}
+    # "success" is the pipeline's terminal verdict for a real deploy AND for an explicit
+    # skip ("skipped: no project changed"); the outcome is recorded, never widened.
+    return {**evidence, "state": status.get("state"), "description": status.get("description") or "",
+            "target_url": status.get("target_url"), "created_at": status.get("created_at"),
+            "outcome": {"success": "success", "pending": "pending", "failure": "failure",
+                        "error": "failure"}.get(status.get("state") or "", "infra")}
+
+
+def _post_merge_evidence(repo: str, branch: str, merge_sha: str,
+                         profile_home: str | None, receipt: dict) -> list[str]:
+    """CI Full + staging evidence for the MERGE COMMIT; returns one outcome per signal."""
+    policy = _policy()
+    workflows = _workflow_names(repo, profile_home)
+    evidence, outcomes = {}, []
+    ci_workflow = policy["ci_workflow"]
+    if ci_workflow in workflows:
+        evidence["ci_full"] = _workflow_evidence(repo, ci_workflow, merge_sha, profile_home)
+        outcomes.append(evidence["ci_full"]["state"])
+    else:
+        evidence["ci_full"] = {"state": "not_applicable",
+                               "detail": f"repository carries no {ci_workflow!r} workflow"}
+    deploy_prefix = policy["deploy_workflow_prefix"]
+    if any(name.startswith(deploy_prefix) for name in workflows):
+        staging = _staging_evidence(repo, branch, merge_sha, policy["deploy_status_context"], profile_home)
+        evidence["staging"] = staging
+        outcomes.append(staging.get("outcome") or staging["state"])
+    else:
+        evidence["staging"] = {"state": "not_applicable",
+                               "detail": f"repository carries no {deploy_prefix}* workflow"}
+    receipt["post_merge"] = evidence
+    return outcomes
+
+
 def _assignee_profile_home(assignee: str | None) -> str | None:
     """Home whose ``gh`` login must read the contract repo — the assignee's, resolved
     exactly as the dispatcher resolves the worker's home — or None (unassigned) so the
@@ -107,7 +249,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": published_pr, "checks": [], "merge_commit_sha": None, "merged_at": None,
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
@@ -121,7 +263,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state merged mergedAt mergeCommit{{oid}}\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -129,8 +271,20 @@ def collect_acceptance(contract: str, published_pr: str | None,
         pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
-        if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
-            raise ValueError("PR is closed or current head is unavailable")
+        receipt["merged_at"] = pr.get("mergedAt")
+        receipt["merge_commit_sha"] = (pr.get("mergeCommit") or {}).get("oid")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError("current head is unavailable")
+        # A card is done when its PR is MERGED, not when its checks are green: an OPEN PR
+        # used to pass here and left the publication orphaned (t_0e6376ca, PR #19268).
+        if not _is_merged(pr):
+            receipt.update(classification="not_merged",
+                           detail=f"The PR is {pr.get('state')} and has not been merged: a card may close only "
+                                  f"once the PR is MERGED into {branch}. Hand it to the merge lane, then retry completion.")
+            return receipt
+        merge_sha = receipt["merge_commit_sha"]
+        if not (isinstance(merge_sha, str) and re.fullmatch(r"[0-9a-f]{40}", merge_sha)):
+            raise ValueError("merged PR has no merge commit to verify CI/staging against")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
@@ -172,10 +326,21 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     "classification": classification, "conclusion": outcome})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
-        if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
+        if (current["head"]["sha"] != sha or current["base"]["ref"] != branch
+                or not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
-        receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+        post_merge = _post_merge_evidence(repo, branch, merge_sha, profile_home, receipt)
+        receipt["classification"] = next((x for x in outcomes + post_merge if x != "success"),
+                                         "missing" if not outcomes else "success")
+        if receipt["classification"] != "success" and not receipt.get("detail"):
+            incomplete = [key for key, value in receipt["post_merge"].items()
+                          if value.get("outcome", value.get("state")) not in {"success", "not_applicable"}]
+            if incomplete:
+                receipt["detail"] = (
+                    f"Post-merge pipeline incomplete ({', '.join(incomplete)}) for merge commit {merge_sha}: "
+                    "the PR is merged, but CI Full and the staging deploy of that commit must both complete. "
+                    "Wait for them, then retry completion.")
         receipt["ok"] = receipt["classification"] == "success"
         return receipt
     except _GateAuthError as exc:

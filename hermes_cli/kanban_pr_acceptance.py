@@ -19,11 +19,80 @@ from urllib.parse import quote
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
+#: The one lifecycle this kernel drives. ``stages`` is the ordered stage chain of
+#: a single card (``implement`` first); ``sec_required_if`` are shell globs the
+#: PR's changed files are matched against before the ``sec`` stage may be
+#: skipped; ``assignees`` overrides the board/profile default per stage; ``pr``
+#: is the PR the exact-head acceptance gate and the sec diff both read.
+LIFECYCLE_STAGES = ("implement", "review", "sec", "merge")
+_LIFECYCLE_KEYS = frozenset({"lifecycle", "stages", "sec_required_if", "assignees", "pr"})
+
+
+def parse_lifecycle_contract(value: str | None) -> dict | None:
+    """The normalized lifecycle block of a JSON ``completion_contract``.
+
+    ``None`` for every other contract form (``local-only``, ``OWNER/REPO``, a PR
+    URL) and for a non-JSON string. Raises ``ValueError`` on a JSON object that
+    does not describe a lifecycle -- an unparseable declaration must fail at
+    creation time, not silently at dispatch time.
+    """
+    if not isinstance(value, str) or not value.lstrip().startswith("{"):
+        return None
+    data = json.loads(value)
+    if not isinstance(data, dict):
+        raise ValueError("completion_contract JSON must be an object")
+    if data.get("lifecycle") != "full":
+        raise ValueError('lifecycle must be "full" (the only declared lifecycle)')
+    unknown = sorted(set(data) - _LIFECYCLE_KEYS)
+    if unknown:
+        raise ValueError(f"unknown lifecycle contract keys: {unknown}")
+    stages = data.get("stages")
+    if (not isinstance(stages, list) or not stages
+            or not all(isinstance(s, str) and s.strip() for s in stages)):
+        raise ValueError("lifecycle stages must be a non-empty list of stage names")
+    stages = [s.strip() for s in stages]
+    if stages[0] != LIFECYCLE_STAGES[0] or len(set(stages)) != len(stages):
+        raise ValueError(
+            f"lifecycle stages must start at {LIFECYCLE_STAGES[0]!r} and not repeat"
+        )
+    bad = [s for s in stages if s not in LIFECYCLE_STAGES]
+    if bad:
+        raise ValueError(f"unknown lifecycle stage(s): {bad}; known: {list(LIFECYCLE_STAGES)}")
+    patterns = data.get("sec_required_if")
+    if patterns is not None and (
+        not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns)
+    ):
+        raise ValueError("sec_required_if must be a list of glob strings")
+    assignees = data.get("assignees")
+    if assignees is not None and (
+        not isinstance(assignees, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in assignees.items())
+    ):
+        raise ValueError("assignees must be a mapping of stage -> profile")
+    pr = data.get("pr")
+    if pr is not None and not (
+        isinstance(pr, str) and (_REPO.fullmatch(pr) or _PR.fullmatch(pr))
+    ):
+        raise ValueError("pr must be OWNER/REPO or an exact GitHub PR URL")
+    return {
+        "lifecycle": "full",
+        "stages": stages,
+        "sec_required_if": None if patterns is None else [p.strip() for p in patterns],
+        "assignees": dict(assignees or {}),
+        "pr": pr,
+    }
+
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
-    if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
+    if not isinstance(value, str):
+        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        parse_lifecycle_contract(stripped)
+        return stripped
+    if not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
         raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
     return value
 
@@ -143,10 +212,36 @@ def collect_acceptance(contract: str, published_pr: str | None,
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
         profile_home = _assignee_profile_home(assignee)
-        declared = _PR.fullmatch(contract)
-        url = contract if declared else published_pr
+        lifecycle = parse_lifecycle_contract(contract)
+        if lifecycle is not None:
+            # A lifecycle contract names its PR explicitly: the exact-head gate
+            # and the sec diff must read the same PR, and a lifecycle card has no
+            # "publish, then bind" step to fall back on.
+            declared_url = lifecycle.get("pr")
+            if not declared_url:
+                receipt["detail"] = (
+                    'A lifecycle completion_contract must declare "pr" '
+                    "(an exact GitHub PR URL) for the exact-head gate."
+                )
+                return receipt
+        else:
+            declared_url = contract if _PR.fullmatch(contract) else None
+        if declared_url is not None and _PR.fullmatch(declared_url):
+            if published_pr and published_pr != declared_url:
+                receipt["detail"] = "metadata.published_pr does not match the persisted completion contract."
+                return receipt
+            url = declared_url
+        else:
+            # OWNER/REPO form (plain or inside a lifecycle contract): the
+            # published PR must live in that repo.
+            repo_decl = contract if declared_url is None else declared_url
+            match = _PR.fullmatch(published_pr or "")
+            if not match or match[1] != repo_decl:
+                receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
+                return receipt
+            url = published_pr
         match = _PR.fullmatch(url or "")
-        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        if not match:
             receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
             return receipt
         repo, number = match[1], int(match[2])

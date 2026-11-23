@@ -36,13 +36,14 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import time
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as _kb
 
 _LIFECYCLE_QUERY = (
     "SELECT id, status, assignee, completed_at, completion_contract FROM tasks "
-    "WHERE status IN ('review', 'done') "
+    "WHERE status IN ('todo', 'ready', 'review', 'done') "
     "AND completion_contract LIKE '%\"lifecycle\"%'"
 )
 
@@ -158,30 +159,42 @@ def sec_required(changed_paths: Iterable[str], patterns: Iterable[str]) -> tuple
     return bool(matched), matched
 
 
-def changed_paths(pr_url: Optional[str], *, assignee: Optional[str] = None) -> Optional[list[str]]:
+def changed_paths(pr_url: Optional[str], *, assignee: Optional[str] = None,
+                  attempts: int = 2) -> Optional[list[str]]:
     """Files the PR currently changes, or ``None`` when that cannot be proven.
 
     Read through the assignee profile's own ``gh`` login (the identity that owns
     the repo, exactly as the acceptance gate does). ``None`` means "unreadable",
     which the caller must treat as ``sec required`` -- never as "clean diff".
+    ``attempts`` retries a transient ``gh`` failure (rate limit, network); the
+    fail-closed answer is unchanged when every attempt fails.
     """
     match = _PR_URL.fullmatch(pr_url or "")
     if not match:
         return None
     repo, number = match[1], int(match[2])
-    try:
-        from hermes_cli.kanban_pr_acceptance import _api, _assignee_profile_home
-        profile_home = _assignee_profile_home(assignee)
-        pages = _api(
-            f"repos/{repo}/pulls/{number}/files?per_page=100",
-            paginate=True, profile_home=profile_home,
-        )
-    except Exception as exc:
-        # A 401/403/404, a missing gh or a network blip all land here: the
-        # lifecycle records the reason and keeps the security stop in place.
+    pages = None
+    last: Optional[BaseException] = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            from hermes_cli.kanban_pr_acceptance import _api, _assignee_profile_home
+            profile_home = _assignee_profile_home(assignee)
+            pages = _api(
+                f"repos/{repo}/pulls/{number}/files?per_page=100",
+                paginate=True, profile_home=profile_home,
+            )
+            break
+        except Exception as exc:
+            # A 401/403/404, a missing gh or a network blip all land here: after
+            # the last attempt the lifecycle records the reason and keeps the
+            # security stop in place.
+            last = exc
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(2)
+    if pages is None:
         _kb._log.warning(
             "kanban lifecycle: PR file list for %s unreadable (%s: %s) -- sec stays required",
-            pr_url, type(exc).__name__, exc,
+            pr_url, type(last).__name__, last,
         )
         return None
     paths = [str(f.get("filename") or "") for page in pages for f in page]
@@ -317,6 +330,26 @@ def plan_advance(
     after = int(boundary["id"]) if boundary is not None else 0
     status = row["status"]
 
+    if boundary is not None and boundary["kind"] == "changes_requested":
+        # A reviewer rejected: the card is already back on the implementer
+        # (``request_changes`` did that), but the audit trail must SHOW the stage
+        # move -- otherwise the chain reads as if review were still in progress.
+        if _event_after(conn, row["id"], "stage_advanced", after) is not None:
+            return None
+        rejected = _kb._json_dict(boundary["payload"])
+        previous = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'stage_advanced' "
+            "AND id < ? ORDER BY id DESC LIMIT 1", (row["id"], after),
+        ).fetchone()
+        from_stage = _kb._json_dict(_kb._row_get(previous, "payload")).get("to") or "review"
+        return {
+            "from": from_stage,
+            "to": "implement",
+            "implementer": rejected.get("implementer") or row["assignee"],
+            "reason": f"changes requested: {str(rejected.get('reason') or '')[:120]}",
+            "rejection": True,
+        }
+
     if status == "review" and stage == "implement":
         handoff = _event_after(conn, row["id"], "review_requested", after)
         if handoff is None:
@@ -405,6 +438,26 @@ def apply_advance(conn, row, spec: dict, plan: dict, *, configured: Optional[dic
     target = plan["to"]
     if not target:
         return {"task": task_id, "skipped": "no next stage"}
+    if plan.get("rejection"):
+        # The card is already back on the implementer (``request_changes`` did the
+        # status/assignee move); this records the stage hop and re-points the card
+        # so the next implement run starts from a named owner.
+        assignee = plan.get("implementer") or row["assignee"]
+        payload = {
+            "from": plan["from"], "to": "implement", "stage_index": 1,
+            "stages": list(stages), "assignee": assignee, "lane": "ready",
+            "reason": plan.get("reason") or "changes requested", "source": "dispatcher",
+            "implementer": assignee,
+        }
+        with _kb.write_txn(conn):
+            current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if current is None or current["status"] != row["status"]:
+                return {"task": task_id, "skipped": "status changed during advance"}
+            if assignee:
+                conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
+            _kb._append_event(conn, task_id, "stage_advanced", payload)
+        return {"task": task_id, "from": payload["from"], "to": "implement",
+                "assignee": assignee, "status": row["status"]}
     assignee = stage_assignee(spec, target, implementer=plan.get("implementer"), configured=configured)
     if not assignee:
         payload = {"stage": plan["from"], "target": target,

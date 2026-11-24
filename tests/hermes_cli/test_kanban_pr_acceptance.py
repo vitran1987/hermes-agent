@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance_store as store
 from hermes_cli.kanban_db_connect import connect
 
 PR = "https://github.com/acme/repo/pull/7"
@@ -503,3 +505,121 @@ def test_unreadable_publication_evidence_refuses_instead_of_passing(acceptance, 
     assert task.status != "done"
     assert receipt["classification"] == "unverifiable"
     assert "could not be read" in receipt["detail"]
+
+
+# --- A publication report is never discarded because its URL failed attribution (P1) ---
+#
+# Attribution credits only a task id in the PR title/head ref or the card's own branch; over the
+# fork's PRs, 0 of 40 head refs carry a task id and only 20 of 40 titles do, so roughly half of all
+# real publication reports are unattributable. Dropping the report there closed the card and skipped
+# arms (b) and (c) — so *adding* `url` to an otherwise refused report flipped refuse -> close.
+
+_UNATTRIBUTED_REPORTS = [
+    pytest.param({"published_pr": PR}, id="published_pr"),
+    pytest.param({"pr": {"number": 7, "head": "b844c1fb2d4", "files": 1}}, id="pr-dict"),
+    pytest.param({"pr_url": PR}, id="pr_url-bare-string"),
+    pytest.param({"pr": {"number": 7, "head": "b844c1fb2d4", "files": 1, "url": PR}},
+                 id="pr-dict-with-url"),
+    pytest.param({"pull_request": {"number": 7, "html_url": PR, "head": "b844c1fb2d4"}},
+                 id="pull_request"),
+]
+
+
+@pytest.mark.parametrize("metadata", _UNATTRIBUTED_REPORTS)
+def test_every_handoff_spelling_of_a_publication_report_is_refused(acceptance, metadata):
+    """Every natural spelling of "I published this PR" refuses the completion. The PR here carries
+    neither a task id in its title nor a matching head ref, so attribution cannot confirm it — which
+    must not be read as "nothing was published"."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="undeclared", completion_contract="local-only")
+        assert not kb.complete_task(conn, tid, result="done", metadata=metadata)
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert receipt["ok"] is False
+    assert PR in receipt["detail"] or "#7" in receipt["detail"]
+
+
+def test_an_unattributed_handoff_report_is_caught_by_the_comment_arm(acceptance):
+    """A real URL that cannot be attributed, plus the card's own thread citing the same PR, must
+    fall through to arm (b) instead of closing the card."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="commented", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"pr_url": PR})
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "a card comment cites" in receipt["detail"]
+    assert PR in receipt["detail"]
+
+
+# --- Arm (c) must reach a repository through an HTTPS remote (P2) ---
+#
+# Hermes workspaces are cloned over HTTPS (`gh repo clone`, `actions/checkout`), and the old parse
+# split on ":" so `https://` became `https///` and "https" counted as a path segment -> every HTTPS
+# remote parsed to None, i.e. the last-resort arm could never fire on this host.
+
+def _workspace_with_remote(tmp_path, remote):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", remote], check=True)
+    return workspace
+
+
+@pytest.mark.parametrize("remote, expected", [
+    ("https://github.com/owner/repo.git", "owner/repo"),
+    ("https://github.com/owner/repo", "owner/repo"),
+    ("git@github.com:o/r.git", "o/r"),
+    ("ssh://git@github.com/o/r.git", "o/r"),
+])
+def test_workspace_remote_reads_every_remote_spelling(tmp_path, acceptance, remote, expected):
+    workspace = _workspace_with_remote(tmp_path, remote)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="ws", workspace_kind="scratch",
+                             workspace_path=str(workspace))
+        assert store._workspace_remote(conn, tid) == expected
+
+
+def test_a_local_only_card_with_an_open_pr_on_its_branch_is_refused_through_an_https_remote(
+        tmp_path, acceptance, monkeypatch):
+    """Non-vacuity for arm (c): an HTTPS workspace remote plus a card branch and an OPEN PR on it
+    must produce a refusal. On the old parse the remote returned None and this card closed."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    workspace = _workspace_with_remote(tmp_path, "https://github.com/acme/repo.git")
+
+    def fake_api(endpoint, **kwargs):
+        assert endpoint.startswith("repos/acme/repo/pulls?state=open&head=acme:"), endpoint
+        return [{"html_url": PR}]
+
+    monkeypatch.setattr(pa, "_api", fake_api)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="branch-pr", completion_contract="local-only",
+                             workspace_kind="worktree", workspace_path=str(workspace),
+                             branch_name="card-branch")
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "card-branch" in receipt["detail"]
+
+
+def test_a_workspace_remote_that_is_a_local_path_publishes_nothing(tmp_path, acceptance, monkeypatch):
+    """The other side of the parse: a workspace whose origin is a local path names no repository, so
+    nothing is read and the card still closes."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    monkeypatch.setattr(pa, "_api", lambda *a, **k: calls.append(a) or {})
+    workspace = _workspace_with_remote(tmp_path, str(tmp_path / "upstream"))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="local clone", completion_contract="local-only",
+                             workspace_kind="worktree", workspace_path=str(workspace),
+                             branch_name="local-branch")
+        assert kb.complete_task(conn, tid, result="done", summary="local branch only")
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "done"
+    assert calls == []
+

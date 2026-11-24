@@ -103,6 +103,38 @@ def _published_by(url, task_id, branch_name, assignee):
     return task_id in title or task_id in head or (bool(branch_name) and head == branch_name)
 
 
+# A git remote arrives in one of four spellings — ``https://host/o/r(.git)``,
+# ``ssh://git@host/o/r.git``, scp-like ``git@host:o/r.git``, and a bare local path. The first three
+# all name a hosted repository; the last one cannot have published a PR. Splitting on ``:`` is what
+# broke the HTTPS arm (``https://`` became ``https///``, so ``"https"`` counted as a path segment).
+_REMOTE_URL_RE = re.compile(
+    r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*)://(?:[^@/]+@)?(?P<host>[^/]+)(?P<path>/.*)$")
+_REMOTE_SCP_RE = re.compile(r"^(?:[^@/\\]+@)?(?P<host>[^:/\\]+):(?P<path>.+)$")
+
+
+def _remote_slug(remote):
+    """``owner/repo`` from any git remote spelling, or ``None`` when it is not a hosted remote."""
+    remote = (remote or "").strip()
+    if not remote:
+        return None
+    match = _REMOTE_URL_RE.match(remote)
+    if match is not None:
+        if match["scheme"].lower() == "file":
+            return None
+        path = match["path"]
+    else:
+        if "://" in remote or "\\" in remote:
+            return None                      # a scheme this parser does not know, or a Windows path
+        match = _REMOTE_SCP_RE.match(remote)
+        if match is None or (len(match["host"]) == 1 and match["host"].isalpha()):
+            return None                      # a local POSIX path / a ``C:`` drive, not a host
+        path = match["path"]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    return f"{parts[-2]}/{parts[-1].removesuffix('.git')}"
+
+
 def _workspace_remote(conn, task_id):
     """``owner/repo`` of the card workspace's git remote, or ``None`` when it has none.
 
@@ -124,11 +156,7 @@ def _workspace_remote(conn, task_id):
     remote = (result.stdout or "").strip()
     if not remote:
         return None
-    tail = remote.split("://", 1)[-1].replace(":", "/").rstrip("/")
-    parts = [part for part in tail.split("/") if part and part != "github.com"]
-    if len(parts) < 3:
-        return None
-    return f"{parts[-2]}/{parts[-1].removesuffix('.git')}"
+    return _remote_slug(remote)
 
 
 def _branch_publication(conn, task_id, branch_name, assignee):
@@ -150,26 +178,35 @@ def _branch_publication(conn, task_id, branch_name, assignee):
 def _derived_publication(conn, task_id, metadata, branch_name, assignee):
     """``(pr_ref_for_detail, source_phrase)`` when a local-only card shows it published a PR.
 
-    ``None`` means no publication evidence was found — the card really is local-only, and a
+    ``None`` means no arm found any publication evidence — the card really is local-only, and a
     genuinely local card reads nothing over the network. Every unreadable source raises and the
     caller refuses: an unreadable source must never be read as "nothing was published".
     """
+    reported = None
     handoff = _handoff_publication(metadata)
     if handoff is not None:
         ref, url = handoff
         if url is None or _published_by(url, task_id, branch_name, assignee):
             return ref, "the completion handoff's metadata PR report names"
-        return None
+        # A failed attribution is not evidence of absence: the handoff itself reports publishing a
+        # PR, so arms (b)/(c) may corroborate *which* PR, but "nothing was published" stopped being
+        # an available answer. Returning None here closed the card and skipped both fallbacks — the
+        # fail-open that rewarded metadata ambiguity (adding `url` to an otherwise refused report
+        # flipped refuse -> close).
+        reported = url
     urls = _commented_pr_urls(conn, task_id)
     if len(urls) > _MAX_PR_REFERENCES:
         raise ValueError(f"{len(urls)} distinct PR references in the comment thread cannot be attributed")
     for url in urls:
-        if _published_by(url, task_id, branch_name, assignee):
+        # The card's own thread citing the very PR its handoff reports publishing attributes it.
+        if url == reported or _published_by(url, task_id, branch_name, assignee):
             return url, "a card comment cites"
     if branch_name:
         url = _branch_publication(conn, task_id, branch_name, assignee)
         if url is not None:
             return url, f"the card branch {branch_name} has an open PR at"
+    if reported is not None:
+        return reported, "the completion handoff's metadata PR report names (unattributed)"
     return None
 
 

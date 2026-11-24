@@ -37,7 +37,17 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 # Single-line JSON in/out; bounded so a misbehaving peer can't balloon memory.
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
-_DEFAULT_CLIENT_TIMEOUT = 2.0
+_DEFAULT_CLIENT_TIMEOUT = 8.0
+# CEO-approved S5 (2026-11-22, in-session): was 2.0. The `<home>/skills` signature walk
+# (agent/skill_commands.published_scopes_signature -> tools/skills_tool._dir_tree_signature)
+# runs on the SAME event loop that serves this control pipe, and a single cold pass over
+# three watched homes measured 1.9 s each (5.6 s total) against a 2.0 s deadline. The
+# result was a periodic fleet-wide wave: every worker of every profile abandoned within
+# the same second, ~2-3x per hour, for weeks. 8.0 matches the timeout this file already
+# uses for `serve-profile` / `unserve-profile` (lines below), so a client that must survive
+# a housekeeping pass now has the same budget as one that must survive a profile swing.
+# The real cure is caching the signature by directory mtime (card t_bbc0d14b, item S2);
+# this constant is the immediate stop-bleed.
 # What a filesystem that cannot host an AF_UNIX node answers: a Docker Desktop (virtiofs) bind mount
 # refuses the socket, and an inode a previous container left there can be neither stat'ed nor
 # removed from inside (#123761). Not EADDRINUSE: a live sibling must keep failing loudly.

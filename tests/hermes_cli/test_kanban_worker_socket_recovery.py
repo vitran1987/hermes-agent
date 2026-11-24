@@ -9,6 +9,7 @@ is still an answer, and an owner that stays silent still fails the worker.
 
 import asyncio
 from contextlib import asynccontextmanager
+import re
 
 import pytest
 from websockets.exceptions import InvalidMessage
@@ -192,9 +193,12 @@ async def test_a_later_loss_gets_a_fresh_budget_from_the_owners_last_answer(monk
 async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
     # Every redial connects, but every receipt read drops: only the owner's answers refresh the
     # budget, so this still ends at OWNER_WAIT_S instead of redialling forever.
+    # Fork PR #36: giving up on the owner is a HOST condition, so it is raised as
+    # ``OwnerUnavailable`` (the marker the dispatcher decodes into ``owner_lost``), not as a plain
+    # card-crash ``GatewayClientError``.
     owner = _Owner(receipts=["pending"] + [_disconnect()] * 200)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds"):
+    with pytest.raises(kanban_worker_client.OwnerUnavailable, match=r"owner unavailable for 1[89]\ds"):
         await _run(owner, monkeypatch, _worker_env)
     assert owner.calls.count("kanban.run") == 1
 
@@ -208,13 +212,17 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
 ], ids=["refused", "starting", "control-reset", "draining"])
 async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock, fault):
     # Every restart shape still ends at OWNER_WAIT_S when it never clears.
+    # Fork PR #36: raised as ``OwnerUnavailable`` (host condition → dispatcher books ``owner_lost``).
     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
+    with pytest.raises(kanban_worker_client.OwnerUnavailable,
+                       match=rf"owner unavailable for \d+s: {re.escape(str(fault))}"):
         await _run(owner, monkeypatch, _worker_env)
     assert clock.now >= kanban_worker_client.OWNER_WAIT_S
-    # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
-    assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
+    # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second. The
+    # transient shapes (``starting``/``deadline``) wait the 900 s revival budget, so their dial
+    # count is proportionally larger; both stay bounded.
+    assert 3 < owner.dials < 200 and owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio
@@ -224,7 +232,9 @@ async def test_giving_up_on_a_refused_handshake_names_the_status(monkeypatch, _w
     refused = InvalidStatus(SimpleNamespace(status_code=403, headers={}, body=b"remote body"))
     owner = _Owner(connects=[None] + [refused] * 60, receipts=["pending", _disconnect()])
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"InvalidStatus \(HTTP 403\)$"):
+    # Fork PR #36: the host condition is raised as ``OwnerUnavailable``; the detail still names the
+    # status and never quotes the remote body.
+    with pytest.raises(kanban_worker_client.OwnerUnavailable, match=r"InvalidStatus \(HTTP 403\)$"):
         await _run(owner, monkeypatch, _worker_env)
 
 

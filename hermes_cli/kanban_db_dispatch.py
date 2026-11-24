@@ -252,6 +252,11 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == _kb.KANBAN_TRANSIENT_OWNER_EXIT_CODE:
+        # The worker itself proved the owner was unreachable (starting/restarting past its revival
+        # budget, duplicate-instance refusal, control socket gone). Authoritative — no need to
+        # guess from the log text the way ``_OWNER_SIDE_MARKERS`` must for older workers.
+        return ("owner_unavailable", code)
     return ("nonzero_exit", code)
 
 
@@ -971,6 +976,40 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
+
+# Host-side owner losses re-admit a card WITHOUT spending its failure budget, but not forever: six
+# consecutive owner deaths mean the owner is genuinely broken and a human must look, so the seventh
+# trips the breaker. Five workers of one dead owner are re-admitted, the sixth asks for help.
+# Ported from fork #36, which shares this bound with the log-text classifier the fork also carries;
+# the live tree has only the exit-code path (``KANBAN_TRANSIENT_OWNER_EXIT_CODE``), which is the
+# authoritative one, so ``_OWNER_SIDE_MARKERS`` is deliberately not reproduced here.
+_OWNER_LOST_FAILURE_LIMIT = 6
+_OWNER_LOST_SCAN_LIMIT = 50
+
+
+def _owner_lost_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of host-side owner losses (newest first, includes this one).
+
+    Mirrors :func:`_protocol_violation_streak`: any other closed run breaks the streak, so the
+    budget counts ONLY owner losses and a real card failure spends its own budget as usual.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _OWNER_LOST_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "owner_lost" or (
+                outcome == "crashed" and _kb._json_dict(row["metadata"]).get("owner_lost")):
+            streak += 1
+            continue
+        break
+    return streak
+
+
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
     # ``kanban_complete`` / ``kanban_block`` / ``kanban_request_review``. Overwhelmingly the work itself succeeded and only the
@@ -1047,6 +1086,10 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    owner_lost: bool = False
+    """The gateway serving this profile died while the worker waited on it: the CARD did not fail,
+    the host did. Booked as ``owner_lost``, not against the card's failure budget (bounded — see
+    :data:`_OWNER_LOST_FAILURE_LIMIT`)."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1054,7 +1097,10 @@ class _DeadWorker:
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a host-side owner loss is
+        # ``owner_lost`` so the board does not charge the card for the host.
+        if self.owner_lost:
+            return "owner_lost"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1122,6 +1168,21 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_unavailable":
+        # Not a card failure: the worker proved the owner could not be reached (t_bbc0d14b).
+        # Booked under the existing ``owner_lost`` taxonomy, which re-admits the card WITHOUT
+        # spending its failure budget and is bounded by ``_OWNER_LOST_FAILURE_LIMIT`` so a
+        # genuinely broken owner still surfaces. Reuses the path an older worker reaches via
+        # ``_OWNER_SIDE_MARKERS``, but from the worker's own exit code instead of log text.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited {code}: the gateway serving this profile was not reachable "
+            "(host condition, not a card fault)",
+            "owner_lost",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "owner_lost": True,
+             "owner_side_reason": "transient_owner_unavailable"},
+            owner_lost=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -1222,7 +1283,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.owner_lost:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1256,7 +1317,32 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
-        if dead.protocol_violation:
+        if dead.owner_lost:
+            # Host-side loss: the worker was fine, the gateway serving its profile died. The card is
+            # already back at ``ready`` with the owner-side error stamped, and NO failure is counted —
+            # re-admission is the point. On 2026-11-17 one gateway death spent nine cards' failure
+            # budgets in the same second, so the blast radius became nine blocked cards.
+            streak = _owner_lost_streak(conn, tid)
+            if streak < _OWNER_LOST_FAILURE_LIMIT:
+                continue
+            # Past the bound the owner is genuinely broken and requeueing only burns slots.
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                failure_limit=1,
+                force_trip=True,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "pid": pid,
+                    "claimer": claimer,
+                    "owner_lost": True,
+                    "owner_lost_streak": streak,
+                    "owner_lost_limit": _OWNER_LOST_FAILURE_LIMIT,
+                },
+            )
+        elif dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:

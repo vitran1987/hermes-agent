@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance_store as store
 from hermes_cli.kanban_db_connect import connect
 
 PR = "https://github.com/acme/repo/pull/7"
@@ -101,7 +103,9 @@ def _respond(state, path):
     elif "/compare/" in path:
         value = {"status": state["compare"]}
     elif "/pulls/" in path:
-        value = {"head": {"sha": sha}, "base": {"ref": "main"},
+        value = {"head": {"sha": sha, "ref": state.get("pr_head_ref", "")},
+                 "title": state.get("pr_title", ""),
+                 "base": {"ref": "main"},
                  "state": "closed" if state["merged"] else "open",
                  "merged": state["merged"]}
     else:
@@ -412,6 +416,222 @@ def test_local_only_card_that_hands_over_a_pr_is_refused(acceptance, contract):
     assert receipt["classification"] == "contract_missing"
     assert PR in receipt["detail"]
 
+
+# --- An UNDECLARED publication must not be a way around the gate (t_3813815d) ---
+
+def test_local_only_card_whose_handoff_reports_a_pr_is_refused(acceptance):
+    """t_3813815d completed `done` with PR #19284 still OPEN: the worker reported the PR in its
+    completion metadata under `pr`, a key the gate never read, and nothing else. A publication
+    report in the handoff is exactly as binding as `metadata.published_pr`."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="escaped", completion_contract="local-only")
+        assert not kb.complete_task(conn, tid, result="done", metadata={
+            "pr": {"number": 19284, "base": "dev", "head": "b844c1fb2d4",
+                   "files": 1, "diff": "+123/-65", "mergeable": "MERGEABLE"}})
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "#19284" in receipt["detail"]
+    assert acceptance["requests"] == []   # the handoff already names the PR; no read needed
+
+
+def test_local_only_card_citing_a_pr_in_a_comment_is_refused(acceptance):
+    """Source 1 of the card: a PR URL in the card's own comment thread. Attributed by the task
+    id in the PR title, so a lane card citing somebody else's PR is not caught by this arm."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="commented", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        acceptance["pr_title"] = f"fix(ci): the thing [{tid}]"
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert PR in receipt["detail"]
+    assert receipt["ok"] is False
+
+
+def test_local_only_card_citing_another_cards_pr_is_not_refused(acceptance, monkeypatch):
+    """Review and merge lane cards routinely cite somebody else's PR; blocking those would make
+    every lane card unclosable. Attribution is the task id in the title/head ref — here it is a
+    different card's, so the card closes and no publication is inferred."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    real_api = pa._api
+
+    def counting_api(endpoint, **kwargs):
+        calls.append(endpoint)
+        return real_api(endpoint, **kwargs)
+
+    monkeypatch.setattr(pa, "_api", counting_api)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="cites-a-sibling", completion_contract="local-only")
+        kb.add_comment(conn, tid, "code-reviewer", f"Reviewed {PR} (belongs to t_deadbeef).")
+        acceptance["pr_title"] = "fix(hermes): a different card's work [t_deadbeef]"
+        assert kb.complete_task(conn, tid, result="done", summary="reviewed, no publication of mine")
+        task = kb.get_task(conn, tid)
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                            (tid,)).fetchone()[0] == 0
+    assert task is not None and task.status == "done"
+    assert len(calls) == 1      # the citation WAS attributed, then dropped — no refusal
+
+
+def test_a_genuinely_local_card_still_completes_without_any_github_read(acceptance, monkeypatch):
+    """The other side of the rule: a local-only card with no PR anywhere must not be blocked, and
+    must not spend a GitHub call proving it."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    monkeypatch.setattr(pa, "_api", lambda *a, **k: calls.append(a) or {})
+    with connect() as conn:
+        tid = kb.create_task(conn, title="local work", completion_contract="local-only")
+        assert kb.complete_task(conn, tid, result="done", summary="rewrote a local config")
+        task = kb.get_task(conn, tid)
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                            (tid,)).fetchone()[0] == 0
+    assert task is not None and task.status == "done"
+    assert calls == []
+
+
+@pytest.mark.parametrize("fault", ["auth", "infra"])
+def test_unreadable_publication_evidence_refuses_instead_of_passing(acceptance, monkeypatch, fault):
+    """Fail closed: an unreadable source must never be read as "nothing was published", or a
+    completed card could pass simply by making its own evidence unreadable."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title="unreadable", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        acceptance["pr_title"] = f"fix: the thing [{tid}]"
+
+        def refused(endpoint, *, query=None, paginate=False, profile_home=None):
+            if fault == "auth":
+                raise pa._GateAuthError(f"HTTP 403 on {endpoint.split('?')[0]}")
+            raise OSError("gh api timed out")
+
+        monkeypatch.setattr(pa, "_api", refused)
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "unverifiable"
+    assert "could not be read" in receipt["detail"]
+
+
+# --- A publication report is never discarded because its URL failed attribution (P1) ---
+#
+# Attribution credits only a task id in the PR title/head ref or the card's own branch; over the
+# fork's PRs, 0 of 40 head refs carry a task id and only 20 of 40 titles do, so roughly half of all
+# real publication reports are unattributable. Dropping the report there closed the card and skipped
+# arms (b) and (c) — so *adding* `url` to an otherwise refused report flipped refuse -> close.
+
+_UNATTRIBUTED_REPORTS = [
+    pytest.param({"published_pr": PR}, id="published_pr"),
+    pytest.param({"pr": {"number": 7, "head": "b844c1fb2d4", "files": 1}}, id="pr-dict"),
+    pytest.param({"pr_url": PR}, id="pr_url-bare-string"),
+    pytest.param({"pr": {"number": 7, "head": "b844c1fb2d4", "files": 1, "url": PR}},
+                 id="pr-dict-with-url"),
+    pytest.param({"pull_request": {"number": 7, "html_url": PR, "head": "b844c1fb2d4"}},
+                 id="pull_request"),
+]
+
+
+@pytest.mark.parametrize("metadata", _UNATTRIBUTED_REPORTS)
+def test_every_handoff_spelling_of_a_publication_report_is_refused(acceptance, metadata):
+    """Every natural spelling of "I published this PR" refuses the completion. The PR here carries
+    neither a task id in its title nor a matching head ref, so attribution cannot confirm it — which
+    must not be read as "nothing was published"."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="undeclared", completion_contract="local-only")
+        assert not kb.complete_task(conn, tid, result="done", metadata=metadata)
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert receipt["ok"] is False
+    assert PR in receipt["detail"] or "#7" in receipt["detail"]
+
+
+def test_an_unattributed_handoff_report_is_caught_by_the_comment_arm(acceptance):
+    """A real URL that cannot be attributed, plus the card's own thread citing the same PR, must
+    fall through to arm (b) instead of closing the card."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="commented", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"pr_url": PR})
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "a card comment cites" in receipt["detail"]
+    assert PR in receipt["detail"]
+
+
+# --- Arm (c) must reach a repository through an HTTPS remote (P2) ---
+#
+# Hermes workspaces are cloned over HTTPS (`gh repo clone`, `actions/checkout`), and the old parse
+# split on ":" so `https://` became `https///` and "https" counted as a path segment -> every HTTPS
+# remote parsed to None, i.e. the last-resort arm could never fire on this host.
+
+def _workspace_with_remote(tmp_path, remote):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", remote], check=True)
+    return workspace
+
+
+@pytest.mark.parametrize("remote, expected", [
+    ("https://github.com/owner/repo.git", "owner/repo"),
+    ("https://github.com/owner/repo", "owner/repo"),
+    ("git@github.com:o/r.git", "o/r"),
+    ("ssh://git@github.com/o/r.git", "o/r"),
+])
+def test_workspace_remote_reads_every_remote_spelling(tmp_path, acceptance, remote, expected):
+    workspace = _workspace_with_remote(tmp_path, remote)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="ws", workspace_kind="scratch",
+                             workspace_path=str(workspace))
+        assert store._workspace_remote(conn, tid) == expected
+
+
+def test_a_local_only_card_with_an_open_pr_on_its_branch_is_refused_through_an_https_remote(
+        tmp_path, acceptance, monkeypatch):
+    """Non-vacuity for arm (c): an HTTPS workspace remote plus a card branch and an OPEN PR on it
+    must produce a refusal. On the old parse the remote returned None and this card closed."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    workspace = _workspace_with_remote(tmp_path, "https://github.com/acme/repo.git")
+
+    def fake_api(endpoint, **kwargs):
+        assert endpoint.startswith("repos/acme/repo/pulls?state=open&head=acme:"), endpoint
+        return [{"html_url": PR}]
+
+    monkeypatch.setattr(pa, "_api", fake_api)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="branch-pr", completion_contract="local-only",
+                             workspace_kind="worktree", workspace_path=str(workspace),
+                             branch_name="card-branch")
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "card-branch" in receipt["detail"]
+
+
+def test_a_workspace_remote_that_is_a_local_path_publishes_nothing(tmp_path, acceptance, monkeypatch):
+    """The other side of the parse: a workspace whose origin is a local path names no repository, so
+    nothing is read and the card still closes."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    monkeypatch.setattr(pa, "_api", lambda *a, **k: calls.append(a) or {})
+    workspace = _workspace_with_remote(tmp_path, str(tmp_path / "upstream"))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="local clone", completion_contract="local-only",
+                             workspace_kind="worktree", workspace_path=str(workspace),
+                             branch_name="local-branch")
+        assert kb.complete_task(conn, tid, result="done", summary="local branch only")
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "done"
+    assert calls == []
 
 # --- a path-filtered REQUIRED context reports `skipped`, and GitHub counts it satisfied ---
 # t_e73a6f56 (PR #18774), t_e1aadc97 (PR #19247), t_ec077972 (PR #19290): every docs-only PR on

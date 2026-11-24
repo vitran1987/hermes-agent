@@ -371,6 +371,11 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == _kb.KANBAN_TRANSIENT_OWNER_EXIT_CODE:
+        # The worker itself proved the owner was unreachable (starting/restarting past its revival
+        # budget, duplicate-instance refusal, control socket gone). Authoritative — no need to
+        # guess from the log text the way ``_OWNER_SIDE_MARKERS`` must for older workers.
+        return ("owner_unavailable", code)
     return ("nonzero_exit", code)
 
 
@@ -1120,6 +1125,7 @@ WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our wor
 # the 12:00 window carried one of these and every one was booked as an ordinary card crash.
 _OWNER_SIDE_MARKERS = (
     "Kanban owner silent",                      # the worker gave up waiting for its owner
+    "Kanban owner unavailable",                 # ditto, from a worker that classified itself (t_bbc0d14b)
     "Kanban owner refused",                     # the owner refused the claim (host-side verdict)
     "Gateway starting: deadline",               # no owner ever came up for this profile
     "Gateway draining",                         # a restart was in progress
@@ -1339,6 +1345,21 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_unavailable":
+        # Not a card failure: the worker proved the owner could not be reached (t_bbc0d14b).
+        # Booked under the existing ``owner_lost`` taxonomy, which re-admits the card WITHOUT
+        # spending its failure budget and is bounded by ``_OWNER_LOST_FAILURE_LIMIT`` so a
+        # genuinely broken owner still surfaces. Reuses the path an older worker reaches via
+        # ``_OWNER_SIDE_MARKERS``, but from the worker's own exit code instead of log text.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited {code}: the gateway serving this profile was not reachable "
+            "(host condition, not a card fault)",
+            "owner_lost",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "owner_lost": True,
+             "owner_side_reason": "transient_owner_unavailable"},
+            owner_lost=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential

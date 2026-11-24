@@ -314,6 +314,14 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
 
+# Worker exit "the profile owner was not reachable, and not because of the card": the client
+# waited out its revival budget while the gateway was starting/restarting, was refused by a
+# duplicate instance that lost the spawn race, or lost its control socket — every one of those is
+# a host condition that a later retry can heal. Booked as ``blocked`` on the RUN (never
+# ``crashed``) and released to the pool WITHOUT counting a failure, so a host-wide outage cannot
+# spend every card's ``failure_limit``. 69 == BSD EX_UNAVAILABLE.
+KANBAN_TRANSIENT_OWNER_EXIT_CODE = 69
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""

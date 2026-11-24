@@ -8,6 +8,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+from contextlib import closing
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -40,6 +41,20 @@ _TRANSIENT_RPC_REASONS = frozenset({'runtime_draining', 'runtime_retired'})
 # stay final.
 _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_control_response',
                                       'invalid_control_response'})
+# Owner refusals that mean "not yet", not "this card is broken" (t_bbc0d14b). Measured on
+# 2026-11-22: 24 worker exits in one hour, every one of them booked as a card crash and charged to
+# the card's failure budget, from a gateway that was merely starting or that had lost a spawn race
+# against the owner already running. A card whose work never started must not pay for the host.
+#
+# Kept deliberately narrow — only reasons that a LATER spawn can heal:
+#   runtime_exited  the gateway this client launched died; the next client starts a fresh one
+#   deadline        the boot window expired; the lane is retried by the supervisor
+# NOT included, with the reason each is excluded:
+#   profile_parked  the profile is parked on purpose; no owner is coming, so waiting 900 s hides it
+#   inaccessible    not a reason code at all (it is the STATE) — the real control-socket refusals
+#                   are `unsafe_control_peer` / `unsafe_control_permissions` / `windows_breakaway_
+#                   unavailable`, all configuration defects whose retry would bury the real fix
+_TRANSIENT_REFUSAL_REASONS = frozenset({'runtime_exited', 'deadline'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
@@ -51,6 +66,22 @@ def admission_answer_budget():
     from hermes_cli import kanban_db_connect
     lock_wait = (kanban_db_connect._BUSY_MAX_RETRIES + 1) * kanban_db_connect._resolve_busy_timeout_ms() / 1000
     return lock_wait + ADMISSION_ANSWER_MARGIN_S
+
+
+class OwnerUnavailable(ValueError):
+    """The profile owner could not be reached, and the card is not at fault.
+
+    Raised only after a failure that passed ``_restartable`` — an owner that was
+    starting/draining past its revival budget, or a transport that stayed lost — so the reason is
+    always a host condition. ``_submit`` maps it to ``KANBAN_TRANSIENT_OWNER_EXIT_CODE`` and the
+    dispatcher books the RUN ``blocked``, releases the card and does NOT count a failure
+    (t_bbc0d14b). A plain ``GatewayClientError`` would be booked as a crash and spend the card's
+    failure budget.
+
+    ``ValueError`` is the same base ``GatewayClientError`` uses, so existing callers that treat an
+    owner refusal as a value error keep working; it is NOT imported from ``gateway_client``
+    because this module delays that import to ``run()`` (the interpreter's bootstrap comes first).
+    """
 
 
 @dataclass
@@ -119,7 +150,13 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                # Every exception that reaches here passed ``_restartable``: the owner was
+                # restarting (draining/starting) or the transport was lost, never a verdict on
+                # this card. Report it as a host outage — the dispatcher books the RUN
+                # ``blocked`` and releases the card without spending its failure budget
+                # (t_bbc0d14b: 24 such exits in one hour were booked as card crashes).
+                raise OwnerUnavailable(
+                    f'Kanban owner unavailable for {claim.silent_for():.0f}s: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -134,19 +171,39 @@ def _restartable(exc):
     if isinstance(exc, GatewayRPCError):
         return str(exc) in _TRANSIENT_RPC_REASONS
     if isinstance(exc, GatewayUnavailableError):
-        return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
+        return (exc.state in _TRANSIENT_OWNER_STATES
+                or exc.reason_code in _RESTART_CONTROL_REASONS
+                or _is_transient_refusal(exc))
     return True
+
+
+def _is_transient_refusal(exc):
+    """*exc* says the owner is not reachable YET (starting, duplicate-instance race, control socket
+    refusing a stale instance) rather than that this card is broken.
+
+    This is the difference between re-queuing a card and burning its failure budget: before
+    t_bbc0d14b only ``draining``/``starting`` retried, so a ``Gateway inaccessible`` /
+    ``runtime_exited`` / ``profile_parked`` / ``deadline`` refusal exited the worker at once and
+    was booked ``crashed``.
+    """
+    from hermes_cli.gateway_client import GatewayUnavailableError
+    if not isinstance(exc, GatewayUnavailableError):
+        return False
+    if exc.state in _TRANSIENT_OWNER_STATES:
+        return True
+    return exc.reason_code in _TRANSIENT_REFUSAL_REASONS
 
 
 def _owner_budget(exc):
     """Seconds this worker may stay silent before giving up on the owner.
 
     A ``starting``/``draining`` owner is a restart in progress: someone is bringing a replacement
-    up, so the worker waits the revival budget instead of the silence budget. Every other
-    restartable failure keeps ``OWNER_WAIT_S``.
+    up, so the worker waits the revival budget instead of the silence budget. The same applies to
+    a transient refusal (``inaccessible`` / ``runtime_exited`` / ``profile_parked`` / ``deadline``):
+    a gateway boot measured at ~4 minutes must not be counted against a 180 s silence budget.
+    Every other restartable failure keeps ``OWNER_WAIT_S``.
     """
-    from hermes_cli.gateway_client import GatewayUnavailableError
-    if isinstance(exc, GatewayUnavailableError) and exc.state in _TRANSIENT_OWNER_STATES:
+    if _is_transient_refusal(exc):
         return OWNER_REVIVAL_WAIT_S
     return OWNER_WAIT_S
 
@@ -185,6 +242,11 @@ async def _await_receipt(client, params, board_db, claim):
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
+        # ``unknown`` is the owner saying "I could not settle this admission", not "the card
+        # failed". The board is the authority: ask it before booking a crash (t_bbc0d14b).
+        reconciled = _reconcile_unknown(params, board_db)
+        if reconciled is not None:
+            return reconciled
         raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
@@ -192,6 +254,69 @@ def _exit_code(receipt, params, board_db):
     if result.get('last_output'):
         print(result['last_output'])
     return result.get('exit_code', 1)
+
+
+# The board write the owner needed lost its busy timeout (measured 2026-11-23 13:03: three workers
+# completed inside 16 s and were booked ``crashed`` with "Kanban execution unknown"). The worker
+# re-reads the board with escalating lock waits — the contention that produced ``unknown`` is
+# exactly what a longer wait absorbs, so the work is often already settled.
+_RECONCILE_BUSY_TIMEOUTS_S = (5.0, 15.0, 30.0)
+
+
+def _read_settlement(board_db, params, busy_timeout_s):
+    """``("result", payload)`` / ``("ended", status)`` for this exact attempt, else ``None``.
+
+    ``result``: the ``worker_result`` event the dispatcher reads — the attempt's own answer.
+    ``ended``: the run was closed by another path (the board SWEPT it), so the card already owns
+    the outcome and re-reporting it would book a phantom failure.
+    """
+    import sqlite3
+    from gateway.session_kanban import worker_result
+    result = worker_result(board_db, params, busy_timeout=busy_timeout_s)
+    if result:
+        return ('result', dict(result))
+    with closing(sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True,
+                                 timeout=busy_timeout_s)) as conn:
+        conn.execute(f'PRAGMA busy_timeout = {int(busy_timeout_s * 1000)}')
+        row = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id = ? AND task_id = ?",
+            (params['run_id'], params['task_id']),
+        ).fetchone()
+    if row and row[0] is not None:
+        return ('ended', str(row[1] or 'ended'))
+    return None
+
+
+def _reconcile_unknown(params, board_db):
+    """Exit code when the board settles this attempt, else ``None`` (the caller fails closed).
+
+    Fail-closed is unchanged: a board that cannot be read, or an attempt nothing settled, still
+    raises. What changes is that a SETTLED attempt is no longer reported as a crash.
+    """
+    last_error = None
+    for attempt, busy_timeout in enumerate(_RECONCILE_BUSY_TIMEOUTS_S, start=1):
+        try:
+            settled = _read_settlement(board_db, params, busy_timeout)
+        except Exception as exc:  # sqlite3.Error, OSError, a missing board file
+            last_error = exc
+            continue
+        if settled is None:
+            continue
+        kind, value = settled
+        if kind == 'result' and isinstance(value, dict):
+            if value.get('last_output'):
+                print(value['last_output'])
+            print(f'RECONCILED: attempt {params["run_id"]} of {params["task_id"]} settled on the '
+                  f'board after {attempt} read(s) — not a crash (the owner reported it unknown)',
+                  file=sys.stderr, flush=True)
+            return int(value.get('exit_code', 0))
+        print(f'RECONCILED: attempt {params["run_id"]} of {params["task_id"]} was already closed '
+              f'by the board (outcome {value}) — not a crash', file=sys.stderr, flush=True)
+        return 0
+    if last_error is not None:
+        print(f'Kanban board unreadable while reconciling an unknown admission: {last_error}',
+              file=sys.stderr, flush=True)
+    return None
 
 
 async def _receipt(client, claim):
@@ -223,6 +348,15 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except OwnerUnavailable as exc:
+        # A host condition, not a card fault: the owner was starting/draining or the transport
+        # stayed lost for the whole revival budget. Exit with the transient sentinel so the
+        # dispatcher books the RUN ``blocked`` and re-queues the card WITHOUT spending its
+        # failure budget. Booking this as ``crashed`` (t_bbc0d14b: 24 exits in one hour) is what
+        # ground the board to 2 running / 49 blocked.
+        from hermes_cli.kanban_db import KANBAN_TRANSIENT_OWNER_EXIT_CODE
+        print(f'Kanban owner unavailable (host condition, not a card fault): {exc}', file=sys.stderr)
+        return KANBAN_TRANSIENT_OWNER_EXIT_CODE
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1

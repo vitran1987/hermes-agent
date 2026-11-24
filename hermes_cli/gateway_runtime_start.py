@@ -1,6 +1,7 @@
 """One detached-process primitive; callers must first prove owner/service absence."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,9 @@ from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_
 from hermes_cli.gateway_launchd_runtime import GatewayJob, start_gateway_job
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 from hermes_cli._startup_fast import project_root_str
+
+
+logger = logging.getLogger(__name__)
 
 
 # A detached gateway claiming any of these believes the service launched it: it skips the
@@ -68,12 +72,43 @@ CLIENT_ELEVATED_REMEDY = (
     "which locks every normal Hermes window out of it. Start Hermes from a normal (non-administrator) window")
 
 
+def _claimed_owner(home: Path) -> int | None:
+    """PID of a live gateway runtime that *currently holds* *home*'s profile claim, else ``None``.
+
+    Both halves are needed, and each alone is wrong:
+
+    - ``missing_owner_state`` proves the flock is HELD right now. A released lock leaves its record
+      behind (``release`` does not truncate it), so a record-only read would report a claim for
+      every gateway that ever stopped and permanently wedge the next start.
+    - ``live_runtime_owner`` proves the holder is a gateway *identity*, and deliberately ignores a
+      purpose-marked maintenance holder (a browse reconcile, a client's lock probe). Those hold the
+      flock transiently and the child already waits them out
+      (``reserve_waiting_out_transient_holders``), so a spawn must not be refused for one.
+
+    Held + gateway identity is the same pair the reserve fence itself enforces, read *before* the
+    child is launched: today the child discovers the conflict instead, inside a detached process
+    whose output nobody reads until it dies ("Cannot reserve gateway profiles: Gateway runtime
+    already owns profile …"), and the caller spends its whole ensure deadline on a card nobody
+    serves (kanban ``execution unknown``).
+    """
+    from gateway.runtime_ownership import live_runtime_owner
+    from hermes_cli.gateway_runtime_discovery import missing_owner_state
+    try:
+        if missing_owner_state(home) != "starting":
+            return None  # nothing holds the lock: a start must stay possible
+    except RuntimeError:
+        return None  # unjudgeable: leave the arbitration to the child's own reserve (fail open here)
+    return live_runtime_owner(home)
+
+
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
                             force: bool = False) -> subprocess.Popen | GatewayJob:
     """Request a daemon, not readiness. Refuse Windows no-breakaway fallback.
 
     No --replace, persistence, login changes, elevation, shell, or inherited stdio.
-    The gateway runtime's own exclusive ownership fence arbitrates racing starts.
+    The gateway runtime's own exclusive ownership fence arbitrates racing starts; a profile whose
+    claim a LIVE runtime already holds is refused here, before a child that could only die on that
+    same fence is launched.
     ``idle_exit``: the daemon ends itself once idle (a chat/TUI/cron client's own start; never
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
@@ -85,6 +120,16 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     if process_is_elevated() and process_elevation_type() != TOKEN_ELEVATION_TYPE_DEFAULT:
         raise RuntimeStartError("client_elevated", detail=CLIENT_ELEVATED_REMEDY)
     home = profile_home.resolve()
+    # A claim held by a LIVE runtime is never ours to overwrite: launching a second daemon for this
+    # home only produces a child that dies on the reserve fence, so refuse here with a reason the
+    # caller can act on. ``force`` is a restart's replacement of an owner this call's caller already
+    # stopped, so it keeps its own arbitration (the run-side guard) and is not second-guessed.
+    if not force and (claimant := _claimed_owner(home)) is not None:
+        logger.warning("Refusing to spawn a gateway for %s: the profile claim is held by live pid %s; "
+                       "attach to that owner or stop it first", home.name, claimant)
+        raise RuntimeStartError(
+            "profile_claimed", state="starting",
+            detail=f"a live gateway (pid {claimant}) already holds this profile's claim; nothing was started")
     root = Path(project_root_str())
     # A root home is only pinned by an explicit selector: without one the child's
     # _apply_profile_override follows the sticky active_profile and boots the wrong

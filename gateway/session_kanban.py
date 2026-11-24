@@ -391,9 +391,16 @@ def worker_result(path, params, busy_timeout=None):
 
     ``busy_timeout`` widens the connection's lock wait: a reconciling worker (a receipt the owner
     reported ``unknown``) re-reads under the same board contention that lost the owner's write.
+
+    ``None`` means "sqlite3's own 5 s default" — the wait this connection had before the argument
+    existed. It must be resolved HERE: ``sqlite3.connect(timeout=None)`` raises ``TypeError: must be
+    real number, not NoneType``, and both managed-worker success paths (``_exit_code`` and
+    ``worker_exit_code``) call this function without the argument, so every clean worker exit died
+    and the dispatcher booked the run ``crashed`` (delta #36 regression, 3 runs on 2026-11-24).
     """
+    timeout = 5.0 if busy_timeout is None else float(busy_timeout)
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True,
-                                 timeout=busy_timeout)) as conn:
+                                 timeout=timeout)) as conn:
         if busy_timeout:
             conn.execute(f'PRAGMA busy_timeout = {int(busy_timeout * 1000)}')
         row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
@@ -402,8 +409,8 @@ def worker_result(path, params, busy_timeout=None):
         return result if result.get('claim_lock') == params['claim_lock'] else {}
 
 
-def worker_exit_code(path, params):
-    return worker_result(path, params).get('exit_code', 1)
+def worker_exit_code(path, params, busy_timeout=None):
+    return worker_result(path, params, busy_timeout=busy_timeout).get('exit_code', 1)
 
 
 # Who wrote a card attempt's prompts: the dispatcher, never the operator, so memory providers do not

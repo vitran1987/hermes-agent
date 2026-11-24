@@ -47,12 +47,16 @@ def _respond(state, path):
     path = path.lstrip("/")
     sha, merge = state["head"], state["merge"]
     if path == "graphql":
+        required = [{"context": "required", "app": {"databaseId": 1}}]
+        # Extra required contexts, each with its own conclusion — a docs-only PR legitimately
+        # reports several required contexts as `skipped` (ci-pr.yml's path filter).
+        required += [{"context": extra["context"], "app": {"databaseId": 1}}
+                     for extra in state.get("extra_required", [])]
         value = {"data": {"repository": {"pullRequest": {
             "headRefOid": sha, "baseRefName": "main", "state": state["state"],
             "merged": state["merged"], "mergedAt": state["merged_at"],
             "mergeCommit": {"oid": merge} if state.get("merge") else None,
-            "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+            "baseRef": {"branchProtectionRule": {"requiredStatusChecks": required}}}}}}
     elif "/rules/branches/" in path:
         value = [[]]
     elif "/check-runs" in path:
@@ -62,6 +66,10 @@ def _respond(state, path):
         if state.get("stale"):
             run["head_sha"] = "b" * 40
         runs = [] if state.get("missing") else [run]
+        runs += [{"id": 43 + i, "name": extra["context"], "head_sha": sha, "app": {"id": 1},
+                  "status": "completed", "conclusion": extra["conclusion"],
+                  "html_url": f"https://github.com/acme/repo/actions/runs/{43 + i}"}
+                 for i, extra in enumerate(state.get("extra_required", []))]
         value = [{"total_count": 100 + len(runs), "check_runs": [
             {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
             for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -168,7 +176,9 @@ def acceptance(tmp_path, monkeypatch):
 @pytest.mark.platforms("linux")
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
-        for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
+        # `skipped` is NOT in this list: a path-filtered REQUIRED context is satisfied (see the
+        # skipped-context tests below). Everything else terminal-but-not-success still refuses.
+        for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
@@ -623,3 +633,41 @@ def test_a_workspace_remote_that_is_a_local_path_publishes_nothing(tmp_path, acc
     assert task is not None and task.status == "done"
     assert calls == []
 
+# --- a path-filtered REQUIRED context reports `skipped`, and GitHub counts it satisfied ---
+# t_e73a6f56 (PR #18774), t_e1aadc97 (PR #19247), t_ec077972 (PR #19290): every docs-only PR on
+# `dev` was uncompletable because `_classify` fell through to `infra` for `skipped`, so the card
+# was refused forever even though GitHub itself had allowed the merge. `ci-pr.yml` computes
+# run_typecheck=false for a docs-only change, so the required contexts legitimately skip.
+
+
+def test_path_filtered_required_contexts_are_satisfied(acceptance):
+    """Three required contexts skipped by the changed-groups filter + a merged PR is a green
+    card: GitHub evaluated the required set as satisfied (that is why the PR could merge)."""
+    with connect() as conn:
+        ok, _, receipt, task = _attempt(conn, acceptance, conclusion="skipped", extra_required=[
+            {"context": "typecheck", "conclusion": "skipped"},
+            {"context": "unit-test", "conclusion": "skipped"}])
+        assert ok and task.status == "done"
+    assert receipt["classification"] == "success" and receipt["ok"] is True
+    # The raw conclusion stays on the record: the receipt says WHY it was satisfied.
+    assert {c["name"]: c["conclusion"] for c in receipt["checks"]} == {
+        "required": "skipped", "typecheck": "skipped", "unit-test": "skipped"}
+
+
+def test_a_skipped_required_context_never_masks_a_failed_sibling(acceptance):
+    """The skip is only forgiven as ITS OWN conclusion. The verdict is the first non-success, so
+    one failing required context still refuses the completion (the fix opens nothing)."""
+    with connect() as conn:
+        ok, _, receipt, task = _attempt(conn, acceptance, conclusion="skipped", extra_required=[
+            {"context": "unit-test", "conclusion": "failure"}])
+        assert not ok and task.status != "done"
+    assert receipt["classification"] == "failure"
+
+
+def test_a_skipped_required_context_does_not_excuse_an_unmerged_pr(acceptance):
+    """Green-by-skip still requires the merge: an OPEN PR is refused before any check is read."""
+    with connect() as conn:
+        ok, _, receipt, task = _attempt(conn, acceptance, conclusion="skipped",
+                                        state="OPEN", merged=False, merged_at=None)
+        assert not ok and task.status != "done"
+    assert receipt["classification"] == "not_merged"

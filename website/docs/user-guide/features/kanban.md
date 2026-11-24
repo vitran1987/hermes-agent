@@ -56,6 +56,24 @@ After publishing, pass `metadata.published_pr` to completion. The first matching
 URL binds the card permanently; retries cannot substitute a green sibling PR.
 CLI `show --json` and `kanban_show` expose the persisted contract.
 
+**Merged is the deliverable.** A card may not complete while its PR is still
+`OPEN`, however green the checks are: an open PR that closed its card was
+abandoned in place. `OPEN` is refused with `classification=not_merged`, and the
+receipt records `merged_at` and `merge_commit_sha` for audit. Once merged, the
+merge commit itself must carry the pipeline: the `CI Full` run at
+`merge_commit_sha` (read at JOB level — a run whose jobs were all `skipped`
+reports `conclusion: success` and is not evidence) and a `deploy/staging`
+success on that commit or on a base-branch tip that contains it. Both are
+recorded under `post_merge` in the receipt; a repository that carries neither
+workflow records `not_applicable` rather than a green. Names are configurable
+under `kanban.acceptance` (`ci_workflow`, `deploy_workflow_prefix`,
+`deploy_status_context`).
+
+A `local-only` card that hands over `metadata.published_pr` is refused with
+`classification=contract_missing`: `local-only` is an explicit statement that no
+PR exists, so a publication under it could never be verified. Report such a PR in
+the completion prose instead, or have the card created with a PR contract.
+
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
 required contexts, paginates exact-head check runs and legacy statuses, then

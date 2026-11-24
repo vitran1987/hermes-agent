@@ -15,11 +15,26 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if snapshot is None:
         return False
     run_id, status, contract = snapshot
+    published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     if not contract or contract == "local-only":
-        return None
+        # A card that publishes a PR cannot close as local-only: returning None here is what
+        # let a worker open a PR and complete in the same breath, leaving it orphaned
+        # (t_0e6376ca, PR #19268). The contract has to be declared at creation, so the
+        # refusal names the repair instead of silently skipping every check.
+        if not (isinstance(published_pr, str) and _PR.fullmatch(published_pr)):
+            return None
+        return snapshot, {
+            "ok": False, "classification": "contract_missing", "head_sha": None,
+            "pr_url": published_pr, "checks": [],
+            "detail": f"This card declares completion_contract=local-only but hands over "
+                      f"{published_pr} as metadata.published_pr, so no merge/CI/staging evidence "
+                      f"can be verified. A PR-publishing card must be created with the repository "
+                      f"slug (OWNER/REPO) or the exact PR URL as its contract.",
+            "recovery": "Report the PR in the completion prose instead of metadata.published_pr, or "
+                        "have the board owner re-create the card with a PR contract and retry completion there.",
+        }
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
-    published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
     if match and contract == match[1]:

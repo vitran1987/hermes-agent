@@ -226,4 +226,14 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
         return "stale"
     if is_run and check.get("status") != "completed":
         return "pending"
-    return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
+    # A REQUIRED context whose job was path-filtered out reports `skipped`, and GitHub counts it
+    # satisfied — which is why such a PR is mergeable and `gh pr checks --required` exits 0.
+    # `ci-pr.yml` computes run_typecheck=false for a docs-only change, so typecheck/unit-test/
+    # config-drift-check legitimately skip; reading that as `infra` made every docs-only PR card
+    # uncompletable (t_e73a6f56, t_e1aadc97, t_ec077972). Only THIS conclusion is forgiven: a
+    # sibling required context that failed, errored, is pending or went stale still decides the
+    # verdict, because the receipt takes the first non-success.
+    # Ported onto the live-source lineage from fork PR #43 (0edd964a492 / squash a5c6aaac25c);
+    # card t_1b59107a.
+    return {"success": "success", "skipped": "success", "failure": "failure",
+            "error": "infra", "pending": "pending"}.get(outcome, "infra")

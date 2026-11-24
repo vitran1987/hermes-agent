@@ -93,7 +93,9 @@ def _respond(state, path):
     elif "/compare/" in path:
         value = {"status": state["compare"]}
     elif "/pulls/" in path:
-        value = {"head": {"sha": sha}, "base": {"ref": "main"},
+        value = {"head": {"sha": sha, "ref": state.get("pr_head_ref", "")},
+                 "title": state.get("pr_title", ""),
+                 "base": {"ref": "main"},
                  "state": "closed" if state["merged"] else "open",
                  "merged": state["merged"]}
     else:
@@ -401,3 +403,103 @@ def test_local_only_card_that_hands_over_a_pr_is_refused(acceptance, contract):
     assert acceptance["requests"] == []          # the contract is the defect; no network read
     assert receipt["classification"] == "contract_missing"
     assert PR in receipt["detail"]
+
+
+# --- An UNDECLARED publication must not be a way around the gate (t_3813815d) ---
+
+def test_local_only_card_whose_handoff_reports_a_pr_is_refused(acceptance):
+    """t_3813815d completed `done` with PR #19284 still OPEN: the worker reported the PR in its
+    completion metadata under `pr`, a key the gate never read, and nothing else. A publication
+    report in the handoff is exactly as binding as `metadata.published_pr`."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="escaped", completion_contract="local-only")
+        assert not kb.complete_task(conn, tid, result="done", metadata={
+            "pr": {"number": 19284, "base": "dev", "head": "b844c1fb2d4",
+                   "files": 1, "diff": "+123/-65", "mergeable": "MERGEABLE"}})
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert "#19284" in receipt["detail"]
+    assert acceptance["requests"] == []   # the handoff already names the PR; no read needed
+
+
+def test_local_only_card_citing_a_pr_in_a_comment_is_refused(acceptance):
+    """Source 1 of the card: a PR URL in the card's own comment thread. Attributed by the task
+    id in the PR title, so a lane card citing somebody else's PR is not caught by this arm."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="commented", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        acceptance["pr_title"] = f"fix(ci): the thing [{tid}]"
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert PR in receipt["detail"]
+    assert receipt["ok"] is False
+
+
+def test_local_only_card_citing_another_cards_pr_is_not_refused(acceptance, monkeypatch):
+    """Review and merge lane cards routinely cite somebody else's PR; blocking those would make
+    every lane card unclosable. Attribution is the task id in the title/head ref — here it is a
+    different card's, so the card closes and no publication is inferred."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    real_api = pa._api
+
+    def counting_api(endpoint, **kwargs):
+        calls.append(endpoint)
+        return real_api(endpoint, **kwargs)
+
+    monkeypatch.setattr(pa, "_api", counting_api)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="cites-a-sibling", completion_contract="local-only")
+        kb.add_comment(conn, tid, "code-reviewer", f"Reviewed {PR} (belongs to t_deadbeef).")
+        acceptance["pr_title"] = "fix(hermes): a different card's work [t_deadbeef]"
+        assert kb.complete_task(conn, tid, result="done", summary="reviewed, no publication of mine")
+        task = kb.get_task(conn, tid)
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                            (tid,)).fetchone()[0] == 0
+    assert task is not None and task.status == "done"
+    assert len(calls) == 1      # the citation WAS attributed, then dropped — no refusal
+
+
+def test_a_genuinely_local_card_still_completes_without_any_github_read(acceptance, monkeypatch):
+    """The other side of the rule: a local-only card with no PR anywhere must not be blocked, and
+    must not spend a GitHub call proving it."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    monkeypatch.setattr(pa, "_api", lambda *a, **k: calls.append(a) or {})
+    with connect() as conn:
+        tid = kb.create_task(conn, title="local work", completion_contract="local-only")
+        assert kb.complete_task(conn, tid, result="done", summary="rewrote a local config")
+        task = kb.get_task(conn, tid)
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                            (tid,)).fetchone()[0] == 0
+    assert task is not None and task.status == "done"
+    assert calls == []
+
+
+@pytest.mark.parametrize("fault", ["auth", "infra"])
+def test_unreadable_publication_evidence_refuses_instead_of_passing(acceptance, monkeypatch, fault):
+    """Fail closed: an unreadable source must never be read as "nothing was published", or a
+    completed card could pass simply by making its own evidence unreadable."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title="unreadable", completion_contract="local-only")
+        kb.add_comment(conn, tid, "developer", f"Opened {PR} — ready for review.")
+        acceptance["pr_title"] = f"fix: the thing [{tid}]"
+
+        def refused(endpoint, *, query=None, paginate=False, profile_home=None):
+            if fault == "auth":
+                raise pa._GateAuthError(f"HTTP 403 on {endpoint.split('?')[0]}")
+            raise OSError("gh api timed out")
+
+        monkeypatch.setattr(pa, "_api", refused)
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task.status != "done"
+    assert receipt["classification"] == "unverifiable"
+    assert "could not be read" in receipt["detail"]

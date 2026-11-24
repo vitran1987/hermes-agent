@@ -315,7 +315,24 @@ def _missing_owner_verdict(home: Path) -> GatewayDiscovery:
     return GatewayDiscovery(state)
 
 
-def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0) -> GatewayDiscovery:
+# A plain discovery's budget (``discover_gateway_endpoint``'s default). Measured on the Windows
+# host, 2026-11-24, against the live generation (cold interpreter, live venv):
+#   the identify that this budget actually bounds (the multiplexer root, which answers for every
+#   named profile) cost 1246 ms COLD (62% of the old 2.0 s) and p99 11 ms warm; the first *call*
+#   of the public function costs 3.9-4.8 s but that is lazy import + cold fs cache, spent before
+#   any socket budget starts, so no timeout can absorb it.
+# 62% of the budget on a single cold probe is no headroom on this host (13 profiles, every worker
+# booting at once), and the same file's sibling constant already reasons this way: S5 raised
+# ``gateway/control_socket.py``'s ``_DEFAULT_CLIENT_TIMEOUT`` 2.0 -> 8.0 on 2026-11-22 for exactly
+# this failure shape (a cold housekeeping pass on the owner's event loop against a 2 s deadline
+# abandoned every worker in the same second). 8.0 keeps a discovery cheaper than
+# ``DISCOVER_TIMEOUT``'s attach path and matches S5, so one cold pass no longer outruns it.
+# Fail-closed is unchanged: an exhausted budget still returns ``control_timeout``.
+DEFAULT_DISCOVER_TIMEOUT = 8.0
+
+
+def discover_gateway_endpoint(profile_home: str | Path, *,
+                              timeout: float = DEFAULT_DISCOVER_TIMEOUT) -> GatewayDiscovery:
     """Read live control identity, preserving uncertainty instead of spawning.
 
     A named profile served by the default multiplexer resolves to the multiplexer's endpoint

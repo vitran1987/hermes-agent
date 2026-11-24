@@ -10,6 +10,68 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 
+PR = "https://github.com/acme/repo/pull/7"
+
+
+def _receipt(conn, task_id):
+    """The gate's verdict lives on the event log, not on ``complete_task``'s return."""
+    rows = [json.loads(r[0]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task_id,))]
+    assert rows
+    return rows[-1]
+
+
+def _attempt(conn, acceptance, **changes):
+    """One completion attempt against the local contract; the GitHub state is the knob."""
+    acceptance.update(changes)
+    tid = kb.create_task(conn, title="post-merge", completion_contract="acme/repo")
+    ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": PR})
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return ok, tid, _receipt(conn, tid), task
+
+
+def _respond(state, path):
+    """The GitHub contract under test, as plain data: the ``github`` fixture below serves it over
+    HTTP to a gh shim, the ``acceptance`` fixture binds it in-process (no gh spawn, any host)."""
+    sha = state["head"]
+    if path == "/graphql":
+        required = [{"context": "required", "app": {"databaseId": 1}}]
+        # Extra required contexts, each with its own conclusion — a docs-only PR legitimately
+        # reports several required contexts as `skipped` (ci-pr.yml's path filter).
+        required += [{"context": extra["context"], "app": {"databaseId": 1}}
+                     for extra in state.get("extra_required", [])]
+        return {"data": {"repository": {"pullRequest": {
+            "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+            "baseRef": {"branchProtectionRule": {"requiredStatusChecks": required}}}}}}
+    if "/rules/branches/" in path:
+        return [[]]
+    if "/check-runs" in path:
+        run = {"id": 42, "name": "required", "head_sha": sha,
+               "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed",
+               "conclusion": state["conclusion"],
+               "html_url": "https://github.com/acme/repo/actions/runs/42"}
+        if state.get("stale"):
+            run["head_sha"] = "b" * 40
+        runs = [] if state.get("missing") else [run]
+        runs += [{"id": 43 + i, "name": extra["context"], "head_sha": sha, "app": {"id": 1},
+                  "status": "completed", "conclusion": extra["conclusion"],
+                  "html_url": f"https://github.com/acme/repo/actions/runs/{43 + i}"}
+                 for i, extra in enumerate(state.get("extra_required", []))]
+        value = [{"total_count": 100 + len(runs), "check_runs": [
+            {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
+            for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+        if state.get("race"):
+            state["race"]()
+        if state.get("head_change"):
+            state["head"] = "b" * 40
+        return value
+    if "/statuses" in path:
+        return [[]]
+    if "/pulls/" in path:
+        return {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+    raise KeyError(path)
+
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
@@ -18,33 +80,9 @@ def github(tmp_path, monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state["requests"].append(self.path)
-            sha = state["head"]
-            if self.path == "/graphql":
-                value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
-            elif "/rules/branches/" in self.path:
-                value = [[]]
-            elif "/check-runs" in self.path:
-                run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
-                       "html_url": "https://github.com/acme/repo/actions/runs/42"}
-                if state.get("stale"):
-                    run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
-                value = [{"total_count": 100 + len(runs), "check_runs": [
-                    {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
-                    for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
-                if state.get("race"):
-                    state["race"]()
-                if state.get("head_change"):
-                    state["head"] = "b" * 40
-            elif "/statuses" in self.path:
-                value = [[]]
-            elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
-            else:
+            try:
+                value = _respond(state, self.path)
+            except KeyError:
                 self.send_error(404)
                 return
             self.send_response(200)
@@ -75,10 +113,29 @@ def github(tmp_path, monkeypatch):
         thread.join()
 
 
+@pytest.fixture
+def acceptance(tmp_path, monkeypatch):
+    """The same GitHub contract bound in-process: no ``gh`` spawn, so the classification rules are
+    provable on any host — the linux/posix-marked tests above cover the subprocess path."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+
+    def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        return _respond(state, endpoint if endpoint.startswith("/") else "/" + endpoint)
+
+    monkeypatch.setattr(pa, "_api", fake_api)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    return state
+
+
 @pytest.mark.platforms("linux")
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
-        for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
+        # `skipped` is NOT in this list: a path-filtered REQUIRED context is satisfied (see the
+        # skipped-context tests below). Everything else terminal-but-not-success still refuses.
+        for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
@@ -347,3 +404,49 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- a path-filtered REQUIRED context reports `skipped`, and GitHub counts it satisfied ---
+# t_e73a6f56 (PR #18774), t_e1aadc97 (PR #19247), t_ec077972 (PR #19290): every docs-only PR on
+# `dev` was uncompletable because `_classify` fell through to `infra` for `skipped`, so the card
+# was refused forever even though GitHub itself had allowed the merge. `ci-pr.yml` computes
+# run_typecheck=false for a docs-only change, so the required contexts legitimately skip.
+# These cases run on any host (the `acceptance` fixture binds the API in-process); they are the
+# live-lineage port of fork PR #43, whose `_classify` is byte-identical to this one.
+
+
+def test_path_filtered_required_contexts_are_satisfied(acceptance):
+    """Three required contexts skipped by the changed-groups filter is a green card: GitHub
+    evaluated the required set as satisfied (that is why the PR could merge)."""
+    with connect() as conn:
+        ok, _, receipt, task = _attempt(conn, acceptance, conclusion="skipped", extra_required=[
+            {"context": "typecheck", "conclusion": "skipped"},
+            {"context": "unit-test", "conclusion": "skipped"}])
+        assert ok and task.status == "done"
+    assert receipt["classification"] == "success" and receipt["ok"] is True
+    # The raw conclusion stays on the record: the receipt says WHY it was satisfied.
+    assert {c["name"]: c["conclusion"] for c in receipt["checks"]} == {
+        "required": "skipped", "typecheck": "skipped", "unit-test": "skipped"}
+
+
+@pytest.mark.parametrize("sibling,expected", [
+    ("failure", "failure"), ("error", "infra"), ("pending", "pending"),
+    ("neutral", "infra"), ("cancelled", "infra")])
+def test_a_skipped_required_context_never_masks_a_sibling(acceptance, sibling, expected):
+    """The skip is forgiven only as ITS OWN conclusion. The verdict is the first non-success, so a
+    sibling required context that failed, errored, is pending or is terminal-but-unknown still
+    refuses the completion — the fix opens nothing."""
+    with connect() as conn:
+        ok, _, receipt, task = _attempt(conn, acceptance, conclusion="skipped", extra_required=[
+            {"context": "unit-test", "conclusion": sibling}])
+        assert not ok and task.status != "done"
+    assert receipt["classification"] == expected
+
+
+def test_a_skipped_required_context_still_loses_to_a_stale_head(acceptance):
+    """A run collected for an old head stays `stale` even when its conclusion is `skipped`: the
+    head comparison runs before the conclusion table, so old-head success is never transferable."""
+    with connect() as conn:
+        ok, _, receipt, _ = _attempt(conn, acceptance, conclusion="skipped", stale=True)
+        assert not ok
+    assert receipt["classification"] == "stale"

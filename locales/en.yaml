@@ -245,6 +245,7 @@ gateway:
       handoff: "Result: {summary}"
       review_detail: "Review feedback: {reason}\nInspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task."
       guidance: "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
+      event_clock: "• event happened at {clock} (older than this turn; check the board before acting)"
     ping:
       completed: "✔ {head} done — {title}{handoff}"
       review_requested: "👀 {head} ready for review — {title}{handoff}"
@@ -266,6 +267,7 @@ gateway:
       timed_out: "⏱ {head} ran past {span} and was stopped; it will be retried automatically."
       blocked: "⏸ {head} blocked{reason}"
       crashed: "✖ {head} — its worker stopped unexpectedly; it will be retried automatically."
+      event_clock: "\n🕒 event {clock}"
       status: "🔄 {head} → {status}"
       board_tag: "[{board}] "
       assignee_tag: "@{assignee} "

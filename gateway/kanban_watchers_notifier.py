@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import re
+import time
 from functools import partial
 from pathlib import Path
 import weakref
@@ -48,6 +50,86 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+
+# A claimed event older than this is not a live alert any more: the card has moved on
+# (or been completed) while the event sat unread — after a gateway restart, a DB-lock
+# retry, or a rewound claim. Re-sending it is the "notification replay" the operator
+# cannot tell apart from a real, fresh failure. Stale events are folded into ONE
+# explicitly-labelled line instead of N fake-fresh alerts; 0 disables the gate.
+_DEFAULT_MAX_EVENT_AGE_SECONDS = 300
+# At most one wake per destination route per window. A crash wave (6 cards dying in
+# the same second) otherwise admits 6 turns into the destination session's FIFO; that
+# FIFO is serial, so every later turn is delivered minutes-to-hours late carrying its
+# original text — the measured 35-111 min alert lag. Coalescing bounds the FIFO depth
+# (the passive ping per event still goes out immediately); 0 disables the gate.
+_DEFAULT_MIN_WAKE_INTERVAL_SECONDS = 120
+
+
+def _notify_policy() -> tuple[int, int]:
+    """``(max_event_age_seconds, min_wake_interval_seconds)`` from ``kanban.*``; defaults on error.
+
+    Both are re-read once per notifier tick so an operator can change them without a
+    restart; a malformed value falls back to the default rather than disabling the gate.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+    except Exception as exc:
+        logger.debug("kanban notifier: policy config unavailable (%s); using defaults", exc)
+        kanban_cfg = {}
+
+    def _int(key: str, default: int) -> int:
+        raw = kanban_cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("kanban notifier: invalid kanban.%s=%r; using %d", key, raw, default)
+            return default
+        return value if value >= 0 else default
+
+    return (_int("notify_max_event_age_seconds", _DEFAULT_MAX_EVENT_AGE_SECONDS),
+            _int("notify_wake_min_interval_seconds", _DEFAULT_MIN_WAKE_INTERVAL_SECONDS))
+
+
+def _event_age_seconds(ev: Any, *, now: Optional[float] = None) -> float:
+    """Seconds since the event was written; a missing/implausible stamp reads as fresh (-1)."""
+    created = getattr(ev, "created_at", None)
+    if not isinstance(created, (int, float)) or created <= 0:
+        return -1.0
+    return (time.time() if now is None else now) - float(created)
+
+
+def _split_by_age(events: list, max_age_seconds: int) -> tuple[list, list]:
+    """``(fresh, stale)`` by ``max_age_seconds``; a disabled gate returns every event fresh.
+
+    An event with no usable stamp (``age < 0``) counts as fresh: the gate exists to drop
+    *known*-old events, and dropping one whose age cannot be established would lose a real
+    alert on a guess.
+    """
+    if max_age_seconds <= 0 or not events:
+        return list(events), []
+    now = time.time()
+    fresh, stale = [], []
+    for ev in events:
+        age = _event_age_seconds(ev, now=now)
+        (stale if age > max_age_seconds else fresh).append(ev)
+    return fresh, stale
+
+
+def _event_clock(ev: Any) -> str:
+    """The event's local wall clock (``HH:MM:SS``); "" when it carries no usable stamp.
+
+    Stamped into every notification so a delivery that was queued behind a busy
+    destination session says WHEN it happened instead of reading as a live failure.
+    """
+    created = getattr(ev, "created_at", None)
+    if not isinstance(created, (int, float)) or created <= 0:
+        return ""
+    try:
+        return datetime.datetime.fromtimestamp(float(created)).strftime("%H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def diagnostic_event(ev) -> bool:
@@ -232,6 +314,7 @@ class _Collector:
         self.notifier_profile = notifier_profile
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
+        self.max_event_age_seconds, self.min_wake_interval_seconds = _notify_policy()
         self.deliveries: list[dict] = []
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
@@ -300,7 +383,15 @@ class _Collector:
             logger.debug("kanban notifier: stale-sub GC failed for board %s: %s", slug, _gc_exc)
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
-        """Claim one subscription's unseen events; None when skipped or nothing new."""
+        """Claim one subscription's unseen events; None when skipped or nothing new.
+
+        Events older than ``kanban.notify_max_event_age_seconds`` are dropped here, at
+        the claim, and reported once at WARNING. The cursor has already advanced past
+        them (``claim_unseen_events_for_sub`` moves it inside BEGIN IMMEDIATE), so a
+        dropped event is never re-claimed — the replay a rewound claim, a DB-lock retry
+        or a gateway restart used to produce. A card keeps notifying: only the *stale
+        copy* is dropped, never the card, and the next event on it is fresh.
+        """
         owner_profile = sub.get("notifier_profile") or None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
@@ -317,10 +408,26 @@ class _Collector:
         )
         if not events:
             return None
+        fresh, stale = _split_by_age(events, self.max_event_age_seconds)
+        if stale:
+            # One line, not one alert: the operator must be able to tell "the board is
+            # noisy" from "a worker just died". The dropped kinds/ids stay in the log
+            # for forensics; the notification stream stays honest.
+            logger.warning(
+                "kanban notifier: dropped %d stale event(s) for %s on board %s (max age %ds): %s",
+                len(stale), sub["task_id"], slug, self.max_event_age_seconds,
+                ", ".join(f"{ev.kind}@id{ev.id}+{int(_event_age_seconds(ev))}s" for ev in stale),
+            )
+        if not fresh:
+            return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                     len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+                     len(fresh), sub["task_id"], slug, old_cursor, cursor)
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": fresh,
+            "task": task, "board": slug, "dropped_stale": len(stale),
+            "min_wake_interval_seconds": self.min_wake_interval_seconds,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -488,6 +595,33 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
 
+def _wake_route_key(sub: dict) -> tuple:
+    """The destination route a wake is admitted into: platform + chat + thread.
+
+    Every subscription on a board funnels into the same handful of routes; the queue
+    that delays a wake is per route, so coalescing must be too.
+    """
+    return ((sub.get("platform") or "").lower(), str(sub.get("chat_id") or ""), sub.get("thread_id") or "")
+
+
+def _wake_admitted_recently(runner: Any, sub: dict, window_seconds: int) -> bool:
+    """Whether a wake for this route was admitted inside ``window_seconds``.
+
+    ``window_seconds <= 0`` disables coalescing. State is per-process and bounded:
+    keys are route tuples (a few per gateway), so it cannot grow without a matching
+    subscription.
+    """
+    if window_seconds <= 0:
+        return False
+    admitted = runner.__dict__.setdefault("_kanban_wake_admitted_at", {})
+    last = admitted.get(_wake_route_key(sub))
+    return last is not None and (time.monotonic() - last) < window_seconds
+
+
+def _record_wake_admitted(runner: Any, sub: dict) -> None:
+    runner.__dict__.setdefault("_kanban_wake_admitted_at", {})[_wake_route_key(sub)] = time.monotonic()
+
+
 class _KanbanNotification:
     """Deliver one subscription's claimed events, then settle the cursor.
 
@@ -507,6 +641,7 @@ class _KanbanNotification:
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
+        self.min_wake_interval_seconds = int(d.get("min_wake_interval_seconds") or 0)
         self.title = (task.title if task else sub["task_id"])[:120]
         self.board_tag = t("gateway.kanban.ping.board_tag", board=self.board_slug) if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
@@ -569,6 +704,13 @@ class _KanbanNotification:
             self.wake_handoff = handoff
         if review_detail is not None:
             self.wake_review_detail = review_detail
+        # Stamp WHEN it happened. The notifier's cursor is prompt, but the wake turn
+        # behind it can wait a long time for the destination session's serial FIFO; an
+        # undated "just crashed" line then reads exactly like a fresh failure. With the
+        # clock on it, a late arrival says which event it belongs to.
+        clock = _event_clock(ev)
+        if msg and clock:
+            msg = f"{msg}{t('gateway.kanban.ping.event_clock', clock=clock)}"
         return msg
 
     def build_wake_text(self) -> None:
@@ -600,6 +742,11 @@ class _KanbanNotification:
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+        # Same reasoning as the ping stamp: this text is executed as a turn whenever the
+        # destination session's FIFO reaches it, which can be long after the event.
+        clocks = [c for c in (_event_clock(ev) for ev in self.d["events"]) if c]
+        if clocks:
+            self.synth += "\n" + t("gateway.kanban.wake.event_clock", clock=min(clocks))
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -794,10 +941,23 @@ class _KanbanNotification:
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
+        # Unless the route was woken inside the coalescing window: then this batch's
+        # ping (already sent) is the delivery and no turn is admitted. The FIFO behind
+        # a busy destination is serial, so admitting one turn per crashed card is what
+        # turns a 6-card wave into six turns delivered 35-111 minutes late, each still
+        # carrying its original "just crashed" text.
+        if wake_payloads and _wake_admitted_recently(self.runner, self.sub, self.min_wake_interval_seconds):
+            logger.info(
+                "kanban notifier: coalesced wake for %s on %s/%s (route woken < %ds ago); "
+                "the ping carried the event",
+                self.task_id, self.platform_str, self.sub["chat_id"], self.min_wake_interval_seconds,
+            )
+            wake_payloads = []
         if wake_payloads:
             try:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
+                _record_wake_admitted(self.runner, self.sub)
                 self.clear_failures()
             except WakeNotAccepted:
                 # Startup / full queue is not a dead destination. Keep the durable

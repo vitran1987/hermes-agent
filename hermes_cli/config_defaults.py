@@ -1932,6 +1932,18 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # A terminal event older than this at claim time is stale: the card has moved on
+        # while the event sat unread (gateway restart, DB-lock retry, rewound claim). Such
+        # an event is dropped at the claim with one WARNING line — never re-sent as a fresh
+        # alert — so a real crash stays distinguishable from a replay. The card keeps
+        # notifying on its next event. 0 = off (deliver every claimed event).
+        "notify_max_event_age_seconds": 300,
+        # At most one wake turn per destination route (platform/chat/thread) per window.
+        # The destination session drains its admission FIFO serially, so one wake per
+        # crashed card turns a 6-card wave into six turns delivered minutes-to-hours late,
+        # each still carrying its original "just crashed" text. Within the window the
+        # per-event passive ping is the delivery and no turn is admitted. 0 = off.
+        "notify_wake_min_interval_seconds": 120,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

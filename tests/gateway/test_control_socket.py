@@ -574,3 +574,75 @@ def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, m
         assert time.monotonic() - start < 2.0
     finally:
         released.set()
+
+
+# ---------------------------------------------------------------------------
+# S5: the client budget must outlive a housekeeping pass on the server's loop
+# ---------------------------------------------------------------------------
+
+# A cold `<home>/skills` signature walk measured 1.9 s per watched home (5.6 s over three)
+# on 2026-11-22 — the pass the old 2.0 s budget could not survive.
+_HOUSEKEEPING_BUSY_SECONDS = 5.0
+
+
+def _housekeeping_pass_blocking_the_loop(seconds: float) -> None:
+    """A cold signature walk is a plain synchronous call, not an await (that is the bug).
+
+    Called from the async scenario below, so the loop cannot accept, read, or answer the
+    connection the client is opening until this returns. ``time.sleep`` is deliberate — a
+    blocked loop is the thing under test — and ASYNC251 is why this is a plain function
+    rather than a direct call inside the coroutine.
+    """
+    import time
+
+    time.sleep(seconds)
+
+
+def test_default_client_budget_covers_the_measured_housekeeping_pass():
+    """The default must exceed the measured cold pass with headroom (was 2.0 against 5.6)."""
+    from gateway import control_socket
+
+    assert control_socket._DEFAULT_CLIENT_TIMEOUT >= _HOUSEKEEPING_BUSY_SECONDS + 1.0, (
+        "a control-pipe client that must survive a skills-signature housekeeping pass needs a "
+        f"budget above the measured {_HOUSEKEEPING_BUSY_SECONDS}s stall, got "
+        f"{control_socket._DEFAULT_CLIENT_TIMEOUT}"
+    )
+
+
+def test_client_query_survives_a_housekeeping_pass_on_the_servers_loop(home: Path):
+    """A client query must be answered, not abandoned, when the loop is busy for 5 s.
+
+    The cold `<home>/skills` signature walk runs on the SAME event loop that accepts this
+    pipe's connections, so a client that connects during a pass waits for the pass to end.
+    At a 2.0 s budget that wait was a timeout and every worker of every profile abandoned
+    inside the same second (the fleet-wide wave). The query below passes NO explicit
+    timeout on purpose: the default budget is the thing under test.
+    """
+    import threading
+
+    release = threading.Event()
+
+    async def scenario():
+        server = GatewayControlServer(
+            home, verb_handlers={"identify": lambda: {"pid": 4242}}
+        )
+        assert await server.start()
+        loop = asyncio.get_running_loop()
+        try:
+            def client():
+                release.wait(30)  # only start once the loop is provably busy
+                return query_gateway_control(home, "identify")
+
+            future = loop.run_in_executor(None, client)
+            release.set()
+            # The pass runs on the loop, exactly as the signature walk does in production.
+            _housekeeping_pass_blocking_the_loop(_HOUSEKEEPING_BUSY_SECONDS)
+            return await future
+        finally:
+            await server.stop()
+
+    result = _run(scenario())
+    assert result == {"pid": 4242}, (
+        "the default client budget abandoned a query whose answer was 5 s away; that is the "
+        "fleet-wide worker wave the constant guards against"
+    )

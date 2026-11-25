@@ -1019,6 +1019,86 @@ WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our wor
 _OWNER_LOST_FAILURE_LIMIT = 6
 _OWNER_LOST_SCAN_LIMIT = 50
 
+# A worker that died because the HOST failed it — the gateway restarting mid-attempt, or the owner's
+# own ledger settling the admission ``interrupted`` — is not a content failure. On 2026-11-25 one
+# authorised gateway restart killed 7 workers in one second; each was booked a plain ``crashed``,
+# charged to its card's failure budget, and (same error fingerprint in one tick) tripped the systemic
+# breaker at ``failure_limit=1``: 7 cards parked ``blocked`` with ``block_kind IS NULL`` + ``sticky``,
+# which nothing ever retries (the D10 burial).
+#
+# The exit-code sentinel (``KANBAN_TRANSIENT_OWNER_EXIT_CODE``) cannot cover this: a worker killed
+# with its gateway leaves no epilogue, so it exits 1/130 like any content crash. What survives is the
+# owner's own attempt note and the worker's last words, so those are what this classifies.
+#
+# Deliberately NOT "Kanban owner refused": the client prints that line from its
+# ``KeyError``/``ValueError``/``OSError`` arm (missing token, unreadable board) — a retry cannot heal
+# a configuration fault, so it must keep spending the card's budget and stay visible.
+_HOST_SIDE_MARKERS = (
+    "owner admission settled interrupted",        # owner_attempt_note: the owner interrupted the attempt
+)
+
+# "managed worker lost" is host-side for the PARK KIND, but it still charges the card's failure
+# budget: the owner lost an execution whose own verdict is unknown, so repeated losses must stay
+# bounded (kanban.failure_limit) instead of looping. Both lists type a park ``transient``.
+_PARK_TRANSIENT_MARKERS = _HOST_SIDE_MARKERS + (
+    "managed worker lost",
+)
+
+# The worker client's own chrome (stderr lines, stripped of log noise): only a client that reached
+# these arms prints them, so they cannot be confused with an agent's prose the way a generic phrase
+# could (the "quoted text is not evidence" rule the protocol-violation streak already follows).
+_HOST_SIDE_LOG_MARKERS = (
+    "Kanban owner silent",                        # the worker gave up waiting for its owner
+    "Kanban owner unavailable",                   # the worker classified itself
+    "Kanban owner restarting",                    # a restart was in progress and outlasted the budget
+    "Gateway starting: deadline",
+    "Gateway draining",
+    "Gateway inaccessible",
+    "Kanban execution unknown; retained by owner",
+)
+
+
+def _host_side_marker(note=None, worker_output=None) -> Optional[str]:
+    """The host-side clause this death carries, or ``None`` when the worker failed itself.
+
+    Only the owner's own note is matched against the note markers, and only the worker's log tail
+    against the client's chrome markers: a phrase quoted in an agent's prose is not evidence (the
+    same rule ``_protocol_violation_streak`` follows).
+    """
+    for marker in _HOST_SIDE_MARKERS:
+        if marker in (note or ""):
+            return marker
+    for marker in _HOST_SIDE_LOG_MARKERS:
+        if marker in (worker_output or ""):
+            return marker
+    return None
+
+
+def _park_kind_for_failure(error: str, extra: Optional[dict] = None) -> Optional[str]:
+    """``block_kind`` for a breaker park caused by *error*, or ``None`` when it is a card failure.
+
+    A host-caused park is typed ``transient`` so the board says "the host did this" instead of parking
+    it untyped — a NULL kind is what every reaper/query filters out, which is how 7 cards vanished on
+    2026-11-25 while still filling the blocked column.
+    """
+    extra = extra or {}
+    if extra.get("owner_lost") or extra.get("host_side"):
+        return "transient"
+    worker_output = extra.get("worker_output")
+    if worker_output:
+        worker_output = str(worker_output).split(WORKER_OUTPUT_SEP)[-1]
+    note = extra.get("attempt_note") or extra.get("owner_side_reason")
+    for marker in _PARK_TRANSIENT_MARKERS:
+        if marker in (note or ""):
+            return "transient"
+    for marker in _HOST_SIDE_LOG_MARKERS:
+        if marker in (worker_output or ""):
+            return "transient"
+    # The note also rides the run error as ``[owner admission settled interrupted]``; read our own
+    # head only, never the worker's quoted output.
+    head = str(error or "").split(WORKER_OUTPUT_SEP)[0]
+    return "transient" if any(m in head for m in _PARK_TRANSIENT_MARKERS) else None
+
 
 def _owner_lost_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of host-side owner losses (newest first, includes this one).
@@ -1242,6 +1322,31 @@ def _classify_dead_worker_exit(
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
+def _classify_host_side(dead: "_DeadWorker") -> None:
+    """Re-book a host-caused death under the existing ``owner_lost`` taxonomy.
+
+    Called after :func:`hermes_cli.kanban_owner_recovery.apply_attempt_note`, so the run's error text
+    already carries both the owner's own clause (``[owner admission settled interrupted]`` /
+    ``[managed worker lost: …]``) and the worker's last words. Either one naming a host-side end is
+    the evidence that the CARD did not fail — the classification the exit code cannot supply for a
+    worker killed with its gateway.
+
+    A card that never reached a verdict of its own is not charged for the host: the run is booked
+    ``owner_lost``, which re-admits it without spending the failure budget and is bounded by
+    ``_OWNER_LOST_FAILURE_LIMIT`` so a permanently broken host still parks (typed) for a human.
+    """
+    if dead.owner_lost or dead.rate_limited or dead.protocol_violation or dead.terminal_provider:
+        return
+    marker = _host_side_marker(dead.event_payload.get("attempt_note"),
+                               dead.event_payload.get("worker_output"))
+    if not marker:
+        return
+    dead.owner_lost = True
+    dead.event_kind = "owner_lost"
+    dead.event_payload["owner_lost"] = True
+    dead.event_payload["owner_side_reason"] = marker
+
+
 @dataclass
 class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
@@ -1288,6 +1393,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            # The owner's record / the worker's own chrome outranks a bare 1/130 exit: a host-caused
+            # death must not be charged to the card. See ``_classify_host_side``.
+            _classify_host_side(dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1500,6 +1608,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1518,9 +1627,17 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``block_kind`` (or, when omitted, :func:`_park_kind_for_failure` reading the
+    error + payload): the ``block_kind`` written with the park. A host-caused
+    trip parks ``transient`` so the card stays selectable; leaving it NULL is
+    what made the 2026-11-25 restart victims invisible to every reaper query.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    park_kind = block_kind if block_kind is not None else _park_kind_for_failure(error, event_payload_extra)
+    if park_kind is not None and park_kind not in _kb.VALID_BLOCK_KINDS:
+        raise ValueError(f"block kind must be one of {sorted(_kb.VALID_BLOCK_KINDS)} or None")
     error = error[:500]
     with _kb.write_txn(conn):
         row = conn.execute(
@@ -1571,14 +1688,22 @@ def _record_task_failure(
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
+        # state; the timeout/crash path already did. ``block_kind`` is written here
+        # (never NULL for a host-caused trip) so the park is selectable: a NULL kind is
+        # what every reaper/query filters out, which is how the 2026-11-25 restart
+        # victims vanished from the board while still occupying the blocked column.
+        set_sql, set_params = [], []
+        if park_kind is not None:
+            set_sql += ["block_kind = ?", "block_recurrences = 1"]
+            set_params.append(park_kind)
+        if release_claim:
+            set_sql.append("claim_lock = NULL, claim_expires = NULL, "
+                           "worker_pid = NULL, worker_started_at = NULL")
+        set_sql += ["consecutive_failures = ?", "last_failure_error = ?"]
         conn.execute(
-            "UPDATE tasks SET status = 'blocked', "
-            + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-               if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            "UPDATE tasks SET status = 'blocked', " + ", ".join(set_sql)
+            + " WHERE id = ? AND status IN ('running', 'ready', 'review')",
+            (*set_params, failures, error, task_id),
         )
         payload = {
             "failures": failures,

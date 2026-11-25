@@ -150,20 +150,40 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    tick_suppressed: Optional[str] = None
+    """Host-wide concurrency cap that made this tick spawn nothing:
+    ``"max_spawn"`` (the board is already at ``kanban.max_spawn``) or
+    ``"max_in_progress"`` (the host is already at ``kanban.max_in_progress``).
+
+    A deliberate throttle, not a fault: the tick returns before any lane row is
+    enumerated, so it fills no other bucket and used to look exactly like a
+    dispatcher that could not spawn work it had no reason to hold back. Health
+    telemetry names it (``tick_capped=<cap>``) so the warning says which cap
+    deferred the tick."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    ``active_pr=1, recent_success=2, rate_limited=1, per_profile_capped=1,
+    per_profile_capped_max=3, skipped_locked=1, memory_pressure=critical`` — the
+    respawn-guard reasons counted per task, the per-profile concurrency cap
+    counted per deferred task plus the highest running count that deferred them,
+    and the tick-level holds. Feeds the "dispatcher stuck" warnings of the CLI
+    daemon and the embedded gateway dispatcher, which otherwise report a bare
+    zero-spawn count while ``hermes kanban tail`` is the only place the guard
+    reason is written (#111910).
+
+    ``skipped_per_profile_capped`` is collected by the lane loop, and used to be
+    dropped here: a tick that deferred every ready card on
+    ``kanban.max_in_progress_per_profile`` rendered an EMPTY string, so the
+    warning fired bare and a normal cap deferral was indistinguishable from a
+    broken profile (venv/PATH/credentials).
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    tick_suppressed: Optional[str] = None
+    capped_max = 0
     for res in results:
         if res is None:
             continue
@@ -171,11 +191,24 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_per_profile_capped:
+            counts["per_profile_capped"] = (
+                counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
+            )
+            capped_max = max(
+                capped_max, *(int(running) for _t, _a, running in res.skipped_per_profile_capped)
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.tick_suppressed:
+            tick_suppressed = res.tick_suppressed
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if capped_max:
+        parts.append(f"per_profile_capped_max={capped_max}")
+    if tick_suppressed:
+        parts.append(f"tick_capped={tick_suppressed}")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
@@ -2314,12 +2347,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.tick_suppressed = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.tick_suppressed = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

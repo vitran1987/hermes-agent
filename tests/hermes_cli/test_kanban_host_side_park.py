@@ -226,3 +226,48 @@ def test_a_systemic_wave_of_content_failures_parks_untyped(board):
         row = board.state(tid)
         assert row["status"] == "blocked", tid
         assert row["block_kind"] is None, tid
+
+
+# --- C: a quota text left behind by an OLD failure cannot hold a recovered card ----------
+
+def _closed_run(board, tid: str, outcome: str, *, ended_at: int, metadata: dict | None = None) -> None:
+    board.conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, metadata, started_at, ended_at) "
+        "VALUES (?, 'fan', ?, ?, ?, ?, ?)",
+        (tid, outcome, outcome, json.dumps(metadata or {}), ended_at - 600, ended_at),
+    )
+    board.conn.commit()
+
+
+def test_a_quota_text_from_an_old_failure_does_not_park_a_recovered_card(board):
+    """2026-11-25: 5 review cards stood still 112 min on a quota text from a run 3-4 h older.
+
+    Their newest run was a SUCCESS (``review_requested``); ``last_failure_error`` is only written by
+    a failure, so it still described an attempt the card had already recovered from. Reading it as a
+    live blocker is the second silent-park failure mode of the same class.
+    """
+    board.conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, created_at, priority, last_failure_error) "
+        "VALUES ('t_recovered', 't_recovered', 'fan', 'review', ?, 5, ?)",
+        (NOW - 86400, "pid 27672 exited rate-limited (quota wall) — requeued without counting a failure"),
+    )
+    board.conn.commit()
+    # Newest run is the successful handoff...
+    _closed_run(board, "t_recovered", "review_requested", ended_at=NOW - 300)
+    # ... and the stale quota text came from an older, already-recovered attempt.
+    _closed_run(board, "t_recovered", "rate_limited", ended_at=NOW - 4 * 3600)
+
+    assert kbd.check_respawn_guard(board.conn, "t_recovered", lane="review") is None
+
+
+def test_a_quota_text_whose_newest_run_failed_still_parks(board):
+    """The guard's real job survives: a live quota/auth blocker still holds the card."""
+    board.conn.execute(
+        "INSERT INTO tasks (id, title, assignee, status, created_at, priority, last_failure_error) "
+        "VALUES ('t_quota', 't_quota', 'fan', 'review', ?, 5, ?)",
+        (NOW - 86400, "pid 27672 exited rate-limited (quota wall) — requeued without counting a failure"),
+    )
+    board.conn.commit()
+    _closed_run(board, "t_quota", "gave_up", ended_at=NOW - 60)
+
+    assert kbd.check_respawn_guard(board.conn, "t_quota", lane="review") == "blocker_auth"

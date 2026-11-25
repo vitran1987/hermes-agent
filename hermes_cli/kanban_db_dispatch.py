@@ -1019,6 +1019,11 @@ WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our wor
 _OWNER_LOST_FAILURE_LIMIT = 6
 _OWNER_LOST_SCAN_LIMIT = 50
 
+# A run outcome that means "the card got where it was going". ``last_failure_error`` is only written
+# by a failure, so when the NEWEST run carries one of these the column describes an attempt the card
+# already recovered from — reading it as a live blocker parks a healthy card.
+_SUCCESS_RUN_OUTCOMES = frozenset({"review_requested", "completed"})
+
 # A worker that died because the HOST failed it — the gateway restarting mid-attempt, or the owner's
 # own ledger settling the admission ``interrupted`` — is not a content failure. On 2026-11-25 one
 # authorised gateway restart killed 7 workers in one second; each was booked a plain ``crashed``,
@@ -1861,10 +1866,16 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097). Neither is a
+    # stale text from before a SUCCESSFUL run: ``last_failure_error`` is only
+    # rewritten by a failure, so a ``review_requested``/``completed`` latest run
+    # means the column still describes an attempt the card already recovered
+    # from — reading it parked 5 review cards for 112 minutes on 2026-11-25
+    # whose last run had in fact handed off cleanly.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    stale_after_success = latest_outcome in _SUCCESS_RUN_OUTCOMES
+    if err and latest_outcome != "crashed" and not stale_after_success and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL

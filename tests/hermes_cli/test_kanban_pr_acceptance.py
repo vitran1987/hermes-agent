@@ -42,7 +42,7 @@ def _state():
             "staging": "success", "compare": "ahead"}
 
 
-def _respond(state, path):
+def _respond(state, path, query=None):
     """One GitHub, two transports: the gh shim below and the in-process acceptance fixture."""
     path = path.lstrip("/")
     sha, merge = state["head"], state["merge"]
@@ -52,13 +52,19 @@ def _respond(state, path):
         # reports several required contexts as `skipped` (ci-pr.yml's path filter).
         required += [{"context": extra["context"], "app": {"databaseId": 1}}
                      for extra in state.get("extra_required", [])]
+        # A fork repository: no branch protection rule and no rulesets, so `required == []`.
+        # `no_required` is True for every repo, or a tuple of "owner/name" slugs for just those.
+        unprotected = state.get("no_required")
+        names = unprotected if isinstance(unprotected, tuple) else ()
+        if unprotected is True or any(f'"{repo_slug}"' in (query or "") for repo_slug in names):
+            required = []
         value = {"data": {"repository": {"pullRequest": {
             "headRefOid": sha, "baseRefName": "main", "state": state["state"],
             "merged": state["merged"], "mergedAt": state["merged_at"],
             "mergeCommit": {"oid": merge} if state.get("merge") else None,
             "baseRef": {"branchProtectionRule": {"requiredStatusChecks": required}}}}}}
     elif "/rules/branches/" in path:
-        value = [[]]
+        value = [[]]                                   # no rulesets: no required set from here
     elif "/check-runs" in path:
         run = {"id": 42, "name": "required", "head_sha": sha,
                "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
@@ -161,7 +167,7 @@ def acceptance(tmp_path, monkeypatch):
     state = _state()
 
     def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
-        return _respond(state, endpoint)
+        return _respond(state, endpoint, query)
 
     monkeypatch.setattr(pa, "_api", fake_api)
     if hasattr(pa, "_policy"):  # absent on the pre-directive kernel: the pins below must be red there
@@ -600,7 +606,15 @@ def test_a_local_only_card_with_an_open_pr_on_its_branch_is_refused_through_an_h
 
     workspace = _workspace_with_remote(tmp_path, "https://github.com/acme/repo.git")
 
-    def fake_api(endpoint, **kwargs):
+    def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        # The repository DOES require status checks, which is what makes this refusal binding:
+        # an ungated repository would be transport (see the transport-rule tests below).
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "baseRefName": "main", "baseRef": {"branchProtectionRule": {
+                    "requiredStatusChecks": [{"context": "required", "app": {"databaseId": 1}}]}}}}}}
+        if "/rules/branches/" in endpoint:
+            return [[]]
         assert endpoint.startswith("repos/acme/repo/pulls?state=open&head=acme:"), endpoint
         return [{"html_url": PR}]
 
@@ -671,3 +685,155 @@ def test_a_skipped_required_context_does_not_excuse_an_unmerged_pr(acceptance):
                                         state="OPEN", merged=False, merged_at=None)
         assert not ok and task.status != "done"
     assert receipt["classification"] == "not_merged"
+
+
+# --- Refuse only while evidence still EXISTS to be fetched (PM rule 2026-11-25, t_81d713e5) ---
+#
+# A `local-only` card that cites a PR in a repository with NO required status checks can never
+# produce the merge/CI/staging verdict the gate verifies: refusing it is not fail-closed, it is
+# always-closed, and it stranded the whole fork-PR population (t_72542ef2 fork PR #44, t_1b59107a
+# fork PR #46: protection 404 - rulesets 0 - runners 0 - required []). The rule is narrow: a
+# citation in a GATED repository still refuses, and an unreadable repository still refuses, so the
+# only completions it opens are ones where no evidence could ever have existed.
+
+
+def _cite(conn, tid, url):
+    kb.add_comment(conn, tid, "developer", f"Opened {url} — ready for review.")
+
+
+def test_a_local_only_card_citing_a_fork_pr_completes_and_records_the_url(acceptance):
+    """Acceptance #1 of the PM's fork rule: fork PR (required == []) cited in a comment => the card
+    completes, and the URL is preserved as the trace instead of vanishing."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fork transport", completion_contract="local-only")
+        _cite(conn, tid, PR)
+        acceptance["pr_title"] = f"fix(hermes): ported fix [{tid}]"
+        acceptance["no_required"] = True
+        assert kb.complete_task(conn, tid, result="done", metadata={"note": "local work"})
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+        run_metadata = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC", (tid,)).fetchone()[0])
+    assert task is not None and task.status == "done"
+    assert receipt["ok"] is True and receipt["classification"] == "transport_only"
+    assert receipt["pr_url"] == PR and PR in receipt["detail"]
+    # The trace: the URL is on the receipt AND back-filled into the handoff metadata.
+    assert run_metadata.get("published_pr_transport") == PR
+
+
+def test_a_local_only_card_citing_a_pr_in_a_gated_repository_still_refuses(acceptance):
+    """Acceptance #2: the SAME shape, but the repository requires status checks => still refused.
+    This is the non-vacuity proof that the fork rule did not become a blanket waiver."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="gated citation", completion_contract="local-only")
+        _cite(conn, tid, PR)
+        acceptance["pr_title"] = f"fix(bangioi): the thing [{tid}]"   # required == [required]
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task is not None and task.status != "done"
+    assert receipt["ok"] is False and receipt["classification"] == "contract_missing"
+    assert PR in receipt["detail"]
+
+
+def test_a_genuinely_local_card_with_no_pr_anywhere_still_completes(acceptance, monkeypatch):
+    """Acceptance #3: no citation, no handoff report, no branch PR => unchanged, and no GitHub read
+    is spent deciding it (the transport rule must not make local cards pay for a network probe)."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    calls = []
+    monkeypatch.setattr(pa, "_api", lambda *a, **k: calls.append(a) or {})
+    with connect() as conn:
+        tid = kb.create_task(conn, title="truly local", completion_contract="local-only")
+        assert kb.complete_task(conn, tid, result="done", summary="rewrote a local config")
+        task = kb.get_task(conn, tid)
+        receipts = conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0]
+    assert task is not None and task.status == "done"
+    assert calls == [] and receipts == 0
+
+
+def test_a_card_citing_one_gated_pr_and_one_fork_pr_still_refuses(acceptance, monkeypatch):
+    """The rule is judged per candidate: seeing a fork PR must not launder a gated one in the same
+    thread. Every publication a card shows is evaluated before the card may close."""
+    other = "https://github.com/acme/gated/pull/9"
+
+    def probe(url, assignee):
+        # Only the SECOND citation is gated: the first is transport, so a card that stopped at the
+        # first candidate would close — the whole point of judging every candidate.
+        return url == other
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title="mixed", completion_contract="local-only")
+        _cite(conn, tid, PR)
+        kb.add_comment(conn, tid, "developer", f"also {other}")
+        acceptance["pr_title"] = f"fix: the thing [{tid}]"
+        acceptance["no_required"] = True
+        monkeypatch.setattr(store, "_evidence_exists", probe)
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task is not None and task.status != "done"
+    assert receipt["classification"] == "contract_missing"
+    assert other in receipt["detail"]
+
+
+def test_an_unreadable_repository_never_counts_as_unprotected(acceptance, monkeypatch):
+    """Fail closed at the transport decision itself: if the required-context probe cannot read the
+    repository, the completion is refused as unverifiable — never closed as transport."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    real_api = pa._api
+
+    def refuse_only_the_probe(endpoint, **kwargs):
+        if endpoint == "graphql":
+            raise pa._GateAuthError("HTTP 403 on graphql")
+        return real_api(endpoint, **kwargs)
+
+    with connect() as conn:
+        tid = kb.create_task(conn, title="probe unreadable", completion_contract="local-only")
+        _cite(conn, tid, PR)
+        acceptance["pr_title"] = f"fix: the thing [{tid}]"
+        monkeypatch.setattr(pa, "_api", refuse_only_the_probe)
+        assert not kb.complete_task(conn, tid, result="done")
+        task, receipt = kb.get_task(conn, tid), _receipt(conn, tid)
+    assert task is not None and task.status != "done"
+    assert receipt["classification"] == "unverifiable"
+    assert "could not be read" in receipt["detail"]
+
+
+def test_evidence_exists_reads_both_required_context_sources(acceptance, monkeypatch):
+    """The probe must agree with `collect_acceptance`: branch protection AND rulesets. A repository
+    that gates only through a ruleset is still gated, so a citation there must refuse."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    def ruleset_only_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "baseRefName": "main",
+                "baseRef": {"branchProtectionRule": None}}}}}     # no classic protection
+        assert "/rules/branches/" in endpoint, endpoint
+        return [[{"type": "required_status_checks",
+                  "parameters": {"required_status_checks": [{"context": "ci", "integration_id": 5}]}}]]
+
+    monkeypatch.setattr(pa, "_api", ruleset_only_api)
+    with connect():
+        assert store._evidence_exists(PR, None) is True
+
+    def nothing_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "baseRefName": "main", "baseRef": {"branchProtectionRule": None}}}}}
+        return [[]]
+
+    monkeypatch.setattr(pa, "_api", nothing_api)
+    with connect():
+        assert store._evidence_exists(PR, None) is False
+
+
+def test_a_probe_against_a_repository_the_login_cannot_see_raises(acceptance, monkeypatch):
+    """A null `repository` in the GraphQL answer is an identity problem, not "requires nothing"."""
+    from hermes_cli import kanban_pr_acceptance as pa
+
+    monkeypatch.setattr(pa, "_api", lambda endpoint, **kwargs: {"data": {"repository": None}})
+    with connect():
+        with pytest.raises(pa._GateAuthError):
+            store._evidence_exists(PR, None)

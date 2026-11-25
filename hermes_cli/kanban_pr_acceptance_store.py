@@ -1,6 +1,7 @@
 """Persist acceptance with the same ownership snapshot as the terminal write."""
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from urllib.parse import quote
@@ -34,6 +35,15 @@ _MAX_PR_REFERENCES = 8
 _DETAIL = ("This card declares completion_contract=local-only but {source} {pr}, so no merge/CI/"
            "staging evidence can be verified. A PR-publishing card must be created with the "
            "repository slug (OWNER/REPO) or the exact PR URL as its contract.")
+# A PR whose repository requires NO status checks has no merge/CI/staging verdict to fetch, so
+# refusing a local-only card over it is not fail-closed — it is always-closed, and it strands every
+# card that publishes to a fork (PM rule 2026-11-25 on t_81d713e5: refuse only when the evidence
+# still exists to be fetched; the PR is then transport, and local evidence closes the card).
+_TRANSPORT_DETAIL = ("This card declares completion_contract=local-only and {source} {pr}, but that "
+                     "repository requires no status checks on its base branch, so no merge/CI/"
+                     "staging verdict exists there to verify. The PR is transport, not evidence: the "
+                     "completion closes on this card's local evidence, and the URL stays on this "
+                     "receipt (and in metadata.published_pr_transport) as the trace.")
 _RECOVERY = ("Report the PR in the completion prose instead of a metadata PR key, or have the board "
              "owner re-create the card with a PR contract and retry completion there.")
 
@@ -50,6 +60,56 @@ def _refusal(published_pr, detail, classification="contract_missing"):
         "pr_url": published_pr, "checks": [], "merge_commit_sha": None, "merged_at": None,
         "detail": detail, "recovery": _RECOVERY,
     }
+
+
+def _transport_receipt(published_pr, source):
+    """The attributed PR cannot carry a verdict: record it and let the card close on local evidence.
+
+    ``ok=True`` is deliberate and narrow — it is only reached after ``_evidence_exists`` positively
+    established that the PR's repository requires no status checks at all, so there is nothing that
+    could have been verified. The receipt keeps the URL on the task event log as the trace.
+    """
+    return {
+        "ok": True, "classification": "transport_only", "head_sha": None,
+        "pr_url": published_pr, "checks": [], "merge_commit_sha": None, "merged_at": None,
+        "detail": _TRANSPORT_DETAIL.format(source=source, pr=published_pr), "recovery": "",
+    }
+
+
+def _evidence_exists(url, assignee):
+    """Does ``url``'s repository still hold evidence a completion could be verified against?
+
+    ``True``  — the PR's base branch requires status checks: the PR CAN carry a verdict.
+    ``False`` — it requires none (fork: no branch protection, no rulesets), read from both sources
+                ``collect_acceptance`` itself uses, so the two cannot disagree.
+    Raises when the repository cannot be read — "could not read" is never "requires nothing".
+    """
+    match = _PR.fullmatch(url)
+    if not match:
+        raise ValueError(f"{url!r} is not a PR URL")
+    repo, number = match[1], int(match[2])
+    owner, name = repo.split("/")
+    profile_home = _accept._assignee_profile_home(assignee)
+    query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
+             f'{{pullRequest(number:{number:d}){{baseRefName '
+             f'baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}')
+    repository = _accept._api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+    if repository is None:
+        raise _accept._GateAuthError(f"HTTP 404 on graphql {repo}")
+    pr = repository.get("pullRequest") or {}
+    branch = pr.get("baseRefName")
+    if not branch:
+        raise ValueError(f"the base branch of {repo}#{number:d} is unavailable")
+    protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
+    required = {(r["context"], (r.get("app") or {}).get("databaseId"))
+                for r in protection.get("requiredStatusChecks") or []}
+    for page in _accept._api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                             paginate=True, profile_home=profile_home):
+        for rule in page:
+            if rule.get("type") == "required_status_checks":
+                required.update((r["context"], r.get("integration_id"))
+                                for r in rule["parameters"]["required_status_checks"])
+    return bool(required)
 
 
 def _handoff_publication(metadata):
@@ -175,39 +235,45 @@ def _branch_publication(conn, task_id, branch_name, assignee):
     return None
 
 
-def _derived_publication(conn, task_id, metadata, branch_name, assignee):
-    """``(pr_ref_for_detail, source_phrase)`` when a local-only card shows it published a PR.
+def _derived_publications(conn, task_id, metadata, branch_name, assignee):
+    """Every ``(pr_ref_for_detail, source_phrase)`` a local-only card shows it published, in order.
 
-    ``None`` means no arm found any publication evidence — the card really is local-only, and a
+    Empty means no arm found any publication evidence — the card really is local-only, and a
     genuinely local card reads nothing over the network. Every unreadable source raises and the
     caller refuses: an unreadable source must never be read as "nothing was published".
+
+    All candidates are returned, not just the first: the caller must judge each PR's repository
+    (does evidence still exist there?), and stopping at the first one would let a card that cites
+    both a gated and an ungated PR close on the ungated one.
     """
+    found = []
     reported = None
     handoff = _handoff_publication(metadata)
     if handoff is not None:
         ref, url = handoff
         if url is None or _published_by(url, task_id, branch_name, assignee):
-            return ref, "the completion handoff's metadata PR report names"
-        # A failed attribution is not evidence of absence: the handoff itself reports publishing a
-        # PR, so arms (b)/(c) may corroborate *which* PR, but "nothing was published" stopped being
-        # an available answer. Returning None here closed the card and skipped both fallbacks — the
-        # fail-open that rewarded metadata ambiguity (adding `url` to an otherwise refused report
-        # flipped refuse -> close).
-        reported = url
+            found.append((ref, "the completion handoff's metadata PR report names"))
+        else:
+            # A failed attribution is not evidence of absence: the handoff itself reports publishing
+            # a PR, so arms (b)/(c) may corroborate *which* PR, but "nothing was published" stopped
+            # being an available answer. Dropping the report here closed the card and skipped both
+            # fallbacks — the fail-open that rewarded metadata ambiguity (adding `url` to an
+            # otherwise refused report flipped refuse -> close).
+            reported = url
     urls = _commented_pr_urls(conn, task_id)
     if len(urls) > _MAX_PR_REFERENCES:
         raise ValueError(f"{len(urls)} distinct PR references in the comment thread cannot be attributed")
     for url in urls:
         # The card's own thread citing the very PR its handoff reports publishing attributes it.
         if url == reported or _published_by(url, task_id, branch_name, assignee):
-            return url, "a card comment cites"
+            found.append((url, "a card comment cites"))
     if branch_name:
         url = _branch_publication(conn, task_id, branch_name, assignee)
         if url is not None:
-            return url, f"the card branch {branch_name} has an open PR at"
+            found.append((url, f"the card branch {branch_name} has an open PR at"))
     if reported is not None:
-        return reported, "the completion handoff's metadata PR report names (unattributed)"
-    return None
+        found.append((reported, "the completion handoff's metadata PR report names (unattributed)"))
+    return found
 
 
 def prepare_acceptance(conn, task_id, expected_run_id, metadata):
@@ -222,6 +288,10 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         # (t_0e6376ca, PR #19268; still true for an UNDECLARED publication — t_3813815d closed
         # done while PR #19284 was OPEN because the handoff never used published_pr).
         if isinstance(published_pr, str) and _PR.fullmatch(published_pr):
+            # A DECLARED publication on a local-only contract is a contract error, not an evidence
+            # question: the worker chose to report a PR while declaring the card needs no PR
+            # acceptance. It refuses without a network read (t_52a486d7), and the fix is to stop
+            # declaring it — so this arm is deliberately NOT subject to the transport rule below.
             return snapshot, _refusal(
                 published_pr,
                 _DETAIL.format(source="the handoff hands over", pr=published_pr)
@@ -229,17 +299,32 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         row = conn.execute("SELECT assignee, branch_name FROM tasks WHERE id=?", (task_id,)).fetchone()
         assignee, branch_name = (row[0], row[1]) if row else (None, None)
         try:
-            derived = _derived_publication(conn, task_id, metadata, branch_name, assignee)
+            candidates = _derived_publications(conn, task_id, metadata, branch_name, assignee)
+            # Refuse only while evidence still EXISTS to be fetched (PM rule 2026-11-25 on
+            # t_81d713e5): a PR whose repository requires no status checks can never carry a
+            # merge/CI/staging verdict, so refusing a local-only card over it is always-closed — it
+            # strands every card that publishes to a fork. The rule is narrow, not a waiver: any
+            # candidate whose repository DOES gate its base branch still refuses the whole card.
+            transport = []
+            for ref, source in candidates:
+                url = ref if _PR.fullmatch(ref) else None
+                if url is not None and not _evidence_exists(url, assignee):
+                    transport.append((url, source))
+                    continue
+                return snapshot, _refusal(ref, _DETAIL.format(source=source, pr=ref))
         except (OSError, subprocess.SubprocessError, ValueError, _accept._GateAuthError) as exc:
             # Fail closed, named: a completion must not pass by making the evidence unreadable.
             return snapshot, _refusal(
                 None, f"The publication evidence a local-only card must be checked against could "
                       f"not be read ({exc}); an unreadable source is never read as \"nothing was "
                       f"published\".", classification="unverifiable")
-        if derived is not None:
-            ref, source = derived
-            return snapshot, _refusal(ref, _DETAIL.format(source=source, pr=ref))
-        return None
+        if not transport:
+            return None
+        # Every publication this card shows is transport-only: record it and close on local evidence.
+        ref, source = transport[0]
+        if isinstance(metadata, dict):
+            metadata["published_pr_transport"] = ref
+        return snapshot, _transport_receipt(ref, source)
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None

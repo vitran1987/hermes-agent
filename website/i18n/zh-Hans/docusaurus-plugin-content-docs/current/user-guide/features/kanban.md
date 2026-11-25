@@ -830,6 +830,9 @@ hermes kanban runs t_abcd
 | `completed` | `{result_len, summary?}` | Worker 写入 `--result` / `--summary` 且任务达到 `done`。`summary` 是第一行交接（400 字符上限）；完整版本存在于运行行上。如果在从未认领的任务上调用 `complete_task` 并带有交接字段，则合成零持续时间运行，以便 `run_id` 仍然指向某处。 |
 | `blocked` | `{reason}` | Worker 或人类将任务翻转为 `blocked`。在带有 `--reason` 的从未认领任务上调用时合成零持续时间运行。 |
 | `unblocked` | — | `blocked → ready`，手动或通过 `/unblock`。`run_id` 为 `NULL`。 |
+| `stage_advanced` | `{from, to, stage_index, stages, assignee, lane, reason, source, sec_decision?, implementer?}` | 调度器把声明了生命周期阶段的卡片推进到下一阶段，仍在**同一张**卡片上：改写 assignee（必要时把 `done` 的卡片重新打开到下一阶段所在的泳道）。`source` 为 `dispatcher`；`sec_decision` 携带 `sec_required_if` 的判定与理由。对 `active_pr` 保护来说，它与操作者手动改派一样是一次合法交接。 |
+| `lifecycle_completed` | `{stage, stages, status}` | 最后一个声明阶段结束：整条链路完成，卡片保持 `done`。 |
+| `lifecycle_deviation` | `{stage, reason, expected, action}` | 链路无法自行推进（例如 `implement` 阶段未经过 review 交接就 complete，或某阶段解析不出 assignee）。不做猜测，等待人工处理。 |
 | `archived` | — | 从默认看板中隐藏。如果任务仍在运行，携带作为副作用被回收的运行的 `run_id`。 |
 
 **编辑**（不是转换的人类驱动变更）：

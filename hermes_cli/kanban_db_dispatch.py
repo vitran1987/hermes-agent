@@ -150,6 +150,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    lifecycle_advanced: list[dict] = field(default_factory=list)
+    """One-card lifecycle moves this tick (``{"task", "from", "to", "assignee",
+    "status"}``), or the planned moves under ``dry_run``. A declared multi-stage
+    card advances its own assignee between stages
+    (``hermes_cli.kanban_lifecycle``); empty on a board with no lifecycle cards."""
     tick_suppressed: Optional[str] = None
     """Host-wide concurrency cap that made this tick spawn nothing:
     ``"max_spawn"`` (the board is already at ``kanban.max_spawn``) or
@@ -1767,10 +1772,24 @@ def check_respawn_guard(
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
     if pr_times:
-        # Strictly after: a same-second tie stays guarded (fail closed).
+        # Strictly after: a same-second tie stays guarded (fail closed) -- a
+        # same-second ``assigned`` may be a no-op reassign racing the comment.
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'stage_advanced')",
+                cols=", kind, payload", strict=True)):
+            return None
+        # ``stage_advanced`` gets an at-or-after comparison: it is written only by
+        # the dispatcher (``hermes_cli.kanban_lifecycle``) or the ops-layer
+        # ``kanban-stage.py``, never by the implementer, and it always names the
+        # next stage's owner. A handoff landing in the SAME second as the PR
+        # comment therefore cannot be the implementer re-spawning itself, and the
+        # tie must not park the card forever -- measured before this rule: a
+        # review->merge advance at the comment's second left the merge stage
+        # guarded on every later tick.
+        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+                conn, "task_events", task_id, max(pr_times),
+                "AND kind = 'stage_advanced'", cols=", kind, payload", strict=False)):
             return None
         return "active_pr"
 
@@ -1801,7 +1820,22 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     --reclaim``), an unassign, or the dispatcher's own
     ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
     the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
+    before it was recorded) are not trusted as handoffs — fail closed.
+
+    Every OTHER kind reaching this function is already a dispatcher/reviewer
+    produced handoff: ``changes_requested`` and ``review_reopened`` route the
+    card back to a named profile, and ``stage_advanced`` is the one-card
+    lifecycle move (``hermes_cli.kanban_lifecycle`` in the dispatcher, or the
+    ops-layer ``hermes/scripts/kanban-stage.py``) that hands the SAME card to the
+    next stage's owner. None of them is a worker re-spawning itself against the
+    PR it just opened, which is the duplicate this guard exists to prevent.
+    """
+    if kind == "stage_advanced":
+        # Dispatcher/ops-layer produced (``hermes_cli.kanban_lifecycle`` or
+        # ``hermes/scripts/kanban-stage.py``). Require the payload to name the
+        # stage it moved TO: a malformed event is not a handoff.
+        data = _kb._json_or(payload, {})
+        return isinstance(data, dict) and bool(data.get("to"))
     if kind != "assigned":
         return True
     data = _kb._json_or(payload, {})
@@ -2467,6 +2501,12 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # One-card lifecycle: a card that declared ``stages`` moves its own assignee
+    # between stages here, BEFORE the spawn budget is computed, so the card it
+    # just handed on can be claimed in this same tick. No operator reassign and
+    # no per-stage child card is involved.
+    from hermes_cli import kanban_lifecycle as _lifecycle
+    result.lifecycle_advanced = _lifecycle.run_phase(conn, dry_run=dry_run)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

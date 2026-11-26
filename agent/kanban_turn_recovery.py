@@ -430,7 +430,6 @@ def park_if_owner_unavailable(
 
 def _emit_recovery_skipped(emit: Optional[Callable[[str], None]], task_id: Optional[str] = None) -> None:
     """The one "no proof, no retry" line — fail-closed is worth saying out loud."""
-    """The one "no proof, no retry" line — fail-closed is worth saying out loud."""
     message = (
         f"[kanban] in-place recovery skipped for {_resolve_task_id(task_id) or 'task'}: this worker no "
         "longer holds a live run/claim (already settled, reclaimed, or unverifiable)"

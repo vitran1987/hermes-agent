@@ -192,9 +192,45 @@ def _owner_unavailable_result(exc) -> dict:
     return {
         "final_response": f"The persistence owner stopped acknowledging this run's receipts ({detail}).",
         "messages": [], "api_calls": 0, "completed": False, "failed": True,
-        "error": f"WorkerReceiptTimeout: {detail}",
+        "error": f"{type(exc).__name__}: {detail}",
         "failure_reason": OWNER_UNAVAILABLE_REASON, "failure_retryable": False,
     }
+
+
+def _owner_silent_result(exc):
+    """Typed terminal result when *exc* is a RECEIPT timeout, else ``None``.
+
+    Only ``WorkerReceiptTimeout`` means "the persistence owner stopped acknowledging this run": the
+    owner is what broke, no model retry can heal it, and the card has to be parked rather than booked
+    as a crash. The rest of the ``WorkerPersistenceError`` family -- ``outbox_full``,
+    ``permission_denied``, ``unsupported_operation``, ``synchronous_self_rpc``, ``pending_receipt``
+    -- are ordinary store failures with their own pre-existing route. Rendering THEM as owner silence
+    would be the same false-cause class this whole change removes, one level down: measured on the
+    previous head, each of those codes produced "The persistence owner stopped acknowledging this
+    run's receipts (outbox_full)", carried ``failure_reason=store_unavailable`` and parked the card
+    blocked/transient with exit 0.
+
+    The type survives the store's sticky latch (``RuntimeSessionStore._latch_failure`` keeps
+    ``type(exc)`` for our own family), so a late call re-raises the same class and still lands here.
+    """
+    from agent.runtime_session_store import WorkerReceiptTimeout
+    if not isinstance(exc, WorkerReceiptTimeout):
+        return None
+    return _owner_unavailable_result(exc)
+
+
+def _owner_silent_or_reraise(exc) -> dict:
+    """``_owner_silent_result(exc)``, re-raising anything else unchanged.
+
+    This is the one line both single-query arms call, so the decision cannot drift between ``-Q``
+    and ``-q``: a receipt timeout becomes the typed owner-silence result, and every other failure --
+    including the rest of the ``WorkerPersistenceError`` family -- escapes as the SAME exception
+    object, exactly as before this change.
+    """
+    result = _owner_silent_result(exc)
+    if result is None:
+        raise exc
+    return result
 
 
 def _park_owner_silent(result, *, emit=None) -> bool:
@@ -239,13 +275,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
             exit_single_query(130)
         except Exception as _turn_exc:
-            # The persistence OWNER stopped answering receipts. That is a host condition, never a
-            # model failure: turn it into a typed terminal result so the owner-silent path below
-            # parks the card instead of letting a traceback end the run as a card crash.
-            from agent.runtime_session_store import WorkerPersistenceError as _WorkerPersistenceError
-            if not isinstance(_turn_exc, _WorkerPersistenceError):
-                raise
-            result = _owner_unavailable_result(_turn_exc)
+            # ONLY a receipt timeout is owner silence (see _owner_silent_or_reraise): every other
+            # persistence failure is re-raised unchanged, so this arm cannot mislabel it as "the
+            # owner stopped answering" and park the card on a false cause.
+            result = _owner_silent_or_reraise(_turn_exc)
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
@@ -593,12 +626,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         try:
             response = cli.chat(query, images=single_query_images or None)
         except Exception as _turn_exc:
-            # Same owner-silence contract as `-Q`: the persistence owner abandoning the turn is a
-            # host condition, so it becomes a typed result the park path below can settle.
-            from agent.runtime_session_store import WorkerPersistenceError as _WorkerPersistenceError
-            if not isinstance(_turn_exc, _WorkerPersistenceError):
-                raise
-            cli._last_turn_result = _owner_unavailable_result(_turn_exc)
+            # Same narrow contract as `-Q` (see _owner_silent_or_reraise): only a RECEIPT timeout
+            # becomes a typed result the park path below can settle; every other store failure is
+            # re-raised unchanged instead of being reported as a silent owner.
+            cli._last_turn_result = _owner_silent_or_reraise(_turn_exc)
             response = ""
         # Kanban worker: a failed-silently turn used to end the run as rc=0 with no
         # terminal kanban call, so the dispatcher booked a protocol violation and

@@ -27,6 +27,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.turn_exit import OWNER_UNAVAILABLE_REASON, turn_exit_code
 from agent import kanban_turn_recovery as ktr
+from agent.runtime_session_store import WorkerPersistenceError, WorkerReceiptTimeout
 
 NOW = int(time.time())
 LOCK = "VI-WORKSPACE:4242"
@@ -176,3 +177,57 @@ def test_a_provider_timeout_result_is_not_parked_as_owner_silence(board, monkeyp
     assert ktr.park_if_owner_unavailable(provider) is False
     assert board.execute("SELECT status FROM tasks WHERE id = 't1'").fetchone()["status"] == "running"
     assert turn_exit_code(provider, kanban_worker=True) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+# ── the arm absorbs the RECEIPT timeout only, never the rest of the store family ────────────────
+#
+# Measured on the previous head: catching the whole ``WorkerPersistenceError`` family made every one
+# of these render "The persistence owner stopped acknowledging this run's receipts (<code>)", carry
+# ``failure_reason=store_unavailable`` and park the card blocked/transient/exit 0. That is the same
+# false-cause class this card exists to remove -- ``outbox_full`` is not a silent owner.
+
+NON_RECEIPT_STORE_CODES = (
+    "outbox_full",
+    "permission_denied",
+    "unsupported_operation",
+    "synchronous_self_rpc",
+    "pending_receipt",
+)
+
+
+@pytest.mark.parametrize("code", NON_RECEIPT_STORE_CODES)
+def test_a_non_receipt_store_failure_is_never_owner_silence(board, monkeypatch, code):
+    from hermes_cli.cli_single_query import _owner_silent_or_reraise, _owner_silent_result
+
+    exc = WorkerPersistenceError(code)
+    assert _owner_silent_result(exc) is None, (
+        f"{code} is a real store failure: reporting it as a silent owner parks the card on a false "
+        "cause and hides the actual failure from whoever picks it up")
+
+    # The one line BOTH single-query arms call must hand the identical exception back to the caller,
+    # not a typed owner-silence result.
+    with pytest.raises(WorkerPersistenceError) as raised:
+        _owner_silent_or_reraise(exc)
+    assert raised.value is exc
+    assert raised.value.args == (code,)
+
+    # ...and nothing downstream can mistake its own route for the owner-silence one.
+    assert ktr.park_if_owner_unavailable({"failed": True, "error": str(exc)}) is False
+    assert ktr.owner_unavailable_failure({"failed": True, "failure_reason": "unknown",
+                                          "error": str(exc)}) is False
+
+
+def test_a_receipt_timeout_is_still_typed_owner_silence(board, monkeypatch):
+    from hermes_cli.cli_single_query import _owner_silent_or_reraise, _owner_silent_result
+
+    receipt = WorkerReceiptTimeout("worker_receipt_timeout")
+    result = _owner_silent_result(receipt)
+    assert result is not None
+    assert result["failure_reason"] == OWNER_UNAVAILABLE_REASON
+    assert result["failure_retryable"] is False
+    assert result["failed"] is True
+    # The cause text names the type that actually arrived -- it is not a hard-coded label.
+    assert result["error"] == "WorkerReceiptTimeout: worker_receipt_timeout"
+    assert ktr.owner_unavailable_failure(result) is True
+    # The arm helper returns the same dict instead of re-raising.
+    assert _owner_silent_or_reraise(receipt) == result

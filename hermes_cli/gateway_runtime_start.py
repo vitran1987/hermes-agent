@@ -18,6 +18,11 @@ from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 
 logger = logging.getLogger(__name__)
 
+# Ceiling on a restart lease's own window (``_restart_lease``). The tooling asks for a window that
+# covers one stop + one start + verification; anything longer than this is not a restart this code
+# can recognise, so it is ignored rather than honoured.
+_RESTART_LEASE_MAX_SECONDS = 1800.0
+
 
 # One launch's policy and pins, never the shared daemon's: hook consent would become daemon-lifetime
 # auto-approval for messaging/cron, and a Kanban worker's or terminal's pins would retarget every later
@@ -71,6 +76,55 @@ def _breakaway_denied(exc: OSError, detach_kwargs: dict) -> bool:
     return getattr(exc, "winerror", None) == _ERROR_ACCESS_DENIED
 
 
+def _restart_lease(home: Path) -> int | None:
+    """PID of the restart run that currently owns *home*, or ``None``.
+
+    A lane whose owner is being deliberately restarted is NOT absent from a client's point of
+    view — it is mid-restart, and the successor belongs to the restarting path, not to whichever
+    client happens to poll first. Measured on the production host 2026-11-26 06:17: nine worker
+    clients replayed the recorded lane argv within 40 s, one child took ``gateway.lock`` and never
+    published a host record, the other eight died on the duplicate-instance guard, and the lane
+    (:9920) stayed DOWN for another 11 minutes while the sanctioned restart was still running.
+
+    The restart tooling writes ``.gateway-restart-in-progress.json`` before it stops anything and
+    removes it when it is done (``gateway-restart-remote.ps1`` :: ``Write-RestartLease``). This
+    reader is fail-open about the file and strict about its contents, because a marker that could
+    wedge a lane would be worse than the storm it prevents:
+
+    * missing / unreadable / malformed -> ``None``: a client must still be able to start a lane;
+    * a lease past its ``expires_at`` -> ``None``: a restarter that died (or hung, which is the
+      2026-11-26 incident) cannot hold a lane down past the window it declared. This expiry is the
+      ONLY backstop, so it is short by construction — the writer declares the restart's own bound,
+      never more than :data:`_RESTART_LEASE_MAX_SECONDS`;
+    * a window beyond that cap -> ``None``: the format is ours, so an out-of-range one is not
+      evidence of anything.
+
+    ``force`` still bypasses the whole check: an operator asking for a start gets one.
+    """
+    import json
+    import time
+
+    path = home / ".gateway-restart-in-progress.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    raw_pid, raw_start, raw_expiry = record.get("pid"), record.get("started_at"), record.get("expires_at")
+    if raw_pid is None or raw_start is None or raw_expiry is None:
+        return None
+    try:
+        holder = int(raw_pid)
+        started_at = float(raw_start)
+        expires_at = float(raw_expiry)
+    except (TypeError, ValueError):
+        return None
+    if not (started_at <= expires_at <= started_at + _RESTART_LEASE_MAX_SECONDS):
+        return None
+    return holder if time.time() <= expires_at else None
+
+
 def _claimed_owner(home: Path) -> int | None:
     """PID of a live gateway runtime that *currently holds* *home*'s profile claim, else ``None``.
 
@@ -114,6 +168,19 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     needed (a named profile under a multiplexer), or it exits on the run-side guard.
     """
     home = profile_home.resolve()
+    # A lane whose owner is being deliberately stopped is NOT absent — it is mid-restart, and the
+    # successor belongs to whatever asked for the stop (``hermes gateway stop``, the supervisor, the
+    # restart tooling). Read BEFORE the claim check: during the drain window the flock is still held
+    # by the exiting owner, so a client that only checked the claim would either be refused with
+    # ``profile_claimed`` or, once the lock is released, spawn the replacement the restart is about
+    # to spawn itself. ``force`` is the operator's own "start it anyway" and keeps its arbitration.
+    if not force and (stopping := _restart_lease(home)) is not None:
+        logger.info("Not spawning a gateway for %s: pid %s announced a planned stop for this home; "
+                    "the successor is the restarting path's to start", home.name, stopping)
+        raise RuntimeStartError(
+            "profile_restarting", state="starting",
+            detail=f"this lane's gateway (pid {stopping}) is being deliberately stopped; "
+                   f"nothing was started, the successor is the restarting path's")
     # A claim held by a LIVE runtime is never ours to overwrite: launching a second daemon for this
     # home only produces a child that dies on the reserve fence, so refuse here with a reason the
     # caller can act on. ``force`` is a restart's replacement of an owner this call's caller already

@@ -31,7 +31,10 @@ deletion).
 Measured cost (2026-11-26, this Windows host, 7077-file / 83.9 MiB selection)
 ----------------------------------------------------------------------------
 * comparison by (size, mtime) when nothing changed: **1.1 s**;
-* publishing one changed module: **0.4 s** (bytes read once, replaced atomically);
+* a full ``--check`` plan against the live install (9 changed files, 29 new, hashed to
+  decide): **4.3 s**;
+* one-file publish end to end, CLI included (plan + lock + journal + re-hash verify):
+  **5.2 s**; a no-op re-run costs the same order (4-15 s, on-access-scanner noise);
 * worst case (empty workspace, every file copied): **111 s**;
 * the stamp-based alternative (hash the same set inside ``expected_stamp``, which runs on every
   ``venv_is_current`` probe) measured **~530 s** for a full content hash, and even a stat-only

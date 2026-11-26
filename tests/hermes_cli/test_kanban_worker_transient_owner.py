@@ -207,3 +207,102 @@ def test_an_unknown_receipt_on_a_broken_board_still_fails_closed(tmp_path):
 
     with pytest.raises(GatewayClientError):
         kwc._exit_code({"status": "unknown"}, dict(PARAMS), str(tmp_path / "missing.db"))
+
+
+def test_an_unknown_receipt_with_no_settlement_still_fails_closed(settlement_db):
+    """The other fail-closed arm: the board IS readable, this attempt simply never settled.
+
+    Reconciliation must not invent an outcome here -- neither a success nor a crash booking made up
+    from the submitter's own exit status.
+    """
+    from hermes_cli.gateway_client import GatewayClientError
+
+    path, _conn = settlement_db
+    with pytest.raises(GatewayClientError):
+        kwc._exit_code({"status": "unknown"}, dict(PARAMS), str(path))
+
+
+# --- a reconciled FAILURE keeps its label ------------------------------------------------------
+#
+# Measured 2026-11-26 on the live board (run 15638 of t_56e39a6d): the managed worker's own turn
+# failed, its ``worker_result`` carried ``exit_code=1``, and the dispatcher booked ``crashed`` from
+# THAT record. The reconcile line beside it said "not a crash", so a crash-rate reader counted it as
+# a misbooking. The marker could not have been right: the board is the authority and it recorded a
+# failure, so the line has to say so.
+
+
+def test_a_reconciled_failure_is_not_reported_as_a_non_crash(settlement_db, capsys):
+    import json
+
+    path, conn = settlement_db
+    conn.execute(
+        "INSERT INTO task_events (run_id, task_id, kind, payload) VALUES (?, 't1', 'worker_result', ?)",
+        (7, json.dumps({"claim_lock": "VI-WORKSPACE:1", "exit_code": 1, "last_output": ""})),
+    )
+    conn.commit()
+
+    code = kwc._exit_code({"status": "unknown"}, dict(PARAMS), str(path))
+
+    assert code == 1, "the board recorded a failure: replaying it is the whole point of the read"
+    err = capsys.readouterr().err
+    assert "RECONCILED" in err
+    assert "not a crash" not in err, (
+        "the board recorded this attempt's own failure -- calling it 'not a crash' is the label "
+        "that inflated the crash-rate reading in the first place")
+    assert "exit code 1" in err and "failure" in err
+
+
+def test_a_settled_record_without_an_exit_code_is_not_a_success(settlement_db):
+    """One absence, one meaning: the settled-receipt path already answered ``1`` here."""
+    import json
+
+    path, conn = settlement_db
+    conn.execute(
+        "INSERT INTO task_events (run_id, task_id, kind, payload) VALUES (?, 't1', 'worker_result', ?)",
+        (7, json.dumps({"claim_lock": "VI-WORKSPACE:1", "last_output": "done"})),
+    )
+    conn.commit()
+
+    assert kwc._exit_code({"status": "unknown"}, dict(PARAMS), str(path)) == 1
+
+
+# --- the booking is the board's, so "reconcile then exit 0" could not have changed it -----------
+
+
+def test_the_dispatcher_books_a_reconciled_failure_from_the_board_not_the_submitters_exit(tmp_path):
+    """Run 15638's exact shape, replayed through the dispatcher's own helpers.
+
+    ``tasks.worker_pid`` is the spawned submitter (34612); the attempt's authority record is the
+    ``worker_result`` the owner-bound interpreter wrote (pid 4436, same claim). The dispatcher reads
+    THAT code before its reap registry or the worker-log trailer, so no value the submitter exits
+    with can turn this booking into anything else. This is the invariant the card's proposed
+    "reconcile -> exit 0" would have left untouched, and it is pinned here so the next reader
+    measures the booking instead of re-deriving it from the log line.
+    """
+    import json
+    import sqlite3
+
+    from hermes_cli.kanban_owner_recovery import managed_run_exit_code
+
+    board = sqlite3.connect(tmp_path / "board.db")
+    board.row_factory = sqlite3.Row
+    board.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, current_run_id INTEGER)")
+    board.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, run_id INTEGER, task_id TEXT, "
+                  "kind TEXT, payload TEXT)")
+    board.execute("INSERT INTO tasks VALUES ('t1', 7)")
+    for kind, payload in (
+        ("worker_bound", {"pid": 4436, "claim_lock": "VI-WORKSPACE:1"}),
+        ("worker_result", {"pid": 4436, "claim_lock": "VI-WORKSPACE:1", "exit_code": 1,
+                           "last_output": ""}),
+    ):
+        board.execute("INSERT INTO task_events (run_id, task_id, kind, payload) VALUES (7, 't1', ?, ?)",
+                      (kind, json.dumps(payload)))
+    board.commit()
+
+    exit_code = managed_run_exit_code(board, "t1", 34612, "VI-WORKSPACE:1")
+    assert exit_code == 1, "the board's own verdict for this attempt"
+
+    dead = kbd._classify_dead_worker_exit(34612, "VI-WORKSPACE:1", exit_code, task_id="t1",
+                                          board="default")
+    assert (dead.kind, dead.run_outcome) == ("nonzero_exit", "crashed")
+

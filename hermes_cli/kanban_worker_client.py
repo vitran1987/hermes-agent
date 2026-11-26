@@ -242,7 +242,7 @@ def _exit_code(receipt, params, board_db):
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
-    return result.get('exit_code', 1)
+    return _settled_exit_code(result)
 
 
 # The board write the owner needed lost its busy timeout (measured 2026-11-23 13:03: three workers
@@ -276,11 +276,33 @@ def _read_settlement(board_db, params, busy_timeout_s):
     return None
 
 
+def _settled_exit_code(payload):
+    """The exit code the board recorded for this attempt (fail-closed on a malformed record).
+
+    ``1`` when the record carries no usable code: a settled attempt whose verdict cannot be read
+    is not a success. Before this, the two settlement paths disagreed on that same absence --
+    ``1`` for a settled receipt, ``0`` here -- so one missing key meant two different outcomes.
+    """
+    try:
+        return int(payload.get('exit_code', 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _reconcile_unknown(params, board_db):
     """Exit code when the board settles this attempt, else ``None`` (the caller fails closed).
 
     Fail-closed is unchanged: a board that cannot be read, or an attempt nothing settled, still
     raises. What changes is that a SETTLED attempt is no longer reported as a crash.
+
+    The returned code is the board's own verdict for this attempt, echoed -- including a failure.
+    It is deliberately NOT forced to ``0``: the worker's exit status is also the trailer the
+    dispatcher falls back to when it cannot read the authority result, so reporting success for an
+    attempt the board recorded as failed would let that path book ``clean_exit`` (a protocol
+    violation) or a false success for a card that really failed. Measured on run 15638 of
+    ``t_56e39a6d``: the board held ``worker_result.exit_code=1`` (the managed worker's own turn
+    failed), and the dispatcher booked ``crashed`` from THAT record, never from this echo --
+    ``managed_run_exit_code`` reads it first (kanban ``t_ac8846b1``).
     """
     last_error = None
     for attempt, busy_timeout in enumerate(_RECONCILE_BUSY_TIMEOUTS_S, start=1):
@@ -295,10 +317,18 @@ def _reconcile_unknown(params, board_db):
         if kind == 'result' and isinstance(value, dict):
             if value.get('last_output'):
                 print(value['last_output'])
+            code = _settled_exit_code(value)
+            # "not a crash" is a claim about the ATTEMPT, so it may only ride on a zero verdict.
+            # Measured 2026-11-26 (run 15638 of t_56e39a6d): the board held the worker's own
+            # failure, but this line called it "not a crash" and the crash-rate reader believed the
+            # marker instead of reading the code beside it (kanban t_ac8846b1).
+            verdict = ('not a crash' if code == 0 else
+                       f"the board recorded this attempt's own failure (exit code {code}); "
+                       f"replaying that verdict, not inventing a crash")
             print(f'RECONCILED: attempt {params["run_id"]} of {params["task_id"]} settled on the '
-                  f'board after {attempt} read(s) — not a crash (the owner reported it unknown)',
+                  f'board after {attempt} read(s) — {verdict} (the owner reported it unknown)',
                   file=sys.stderr, flush=True)
-            return int(value.get('exit_code', 0))
+            return code
         print(f'RECONCILED: attempt {params["run_id"]} of {params["task_id"]} was already closed '
               f'by the board (outcome {value}) — not a crash', file=sys.stderr, flush=True)
         return 0

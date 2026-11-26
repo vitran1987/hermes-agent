@@ -231,3 +231,176 @@ def test_a_receipt_timeout_is_still_typed_owner_silence(board, monkeypatch):
     assert ktr.owner_unavailable_failure(result) is True
     # The arm helper returns the same dict instead of re-raising.
     assert _owner_silent_or_reraise(receipt) == result
+
+
+# ── the ARM itself, not only the helper it calls ────────────────────────────────────────────────
+#
+# Both single-query drivers catch around the turn and hand the exception to the one shared helper.
+# Pinning the helper alone leaves the call site untested: a widened ``except`` there, or a re-raise
+# that dropped the exception type, would pass every test above.
+#
+# These drive the runner through the ``cli`` facade SEAM it late-binds (``from cli import ...``
+# inside the function) with a stub in ``sys.modules``: importing the real facade pulls the launcher
+# bootstrap, which is neither part of this contract nor safe to run from a test process.
+
+@pytest.fixture
+def quiet_runner_seam(monkeypatch):
+    """The ``-Q`` runner with its late-bound ``cli`` names replaced by a stub module."""
+    import sys
+    from types import SimpleNamespace
+
+    from hermes_cli import cli_single_query as csq
+    from hermes_cli.turn_exit import (
+        TERMINAL_PROVIDER_REASONS, TRANSIENT_PROVIDER_REASONS,
+    )
+
+    recovered: list = []
+    monkeypatch.setattr(ktr, "recover_failed_kanban_turns",
+                        lambda *args, **kwargs: recovered.append(args))
+    stub = SimpleNamespace(
+        _emit_interrupted_session_end=lambda *args, **kwargs: None,
+        _run_kanban_goal_loop_q=lambda *args, **kwargs: None,
+        _single_query_exit_code=csq._single_query_exit_code,
+        _sync_cli_session_id_from_agent=csq._sync_cli_session_id_from_agent,
+        _TERMINAL_PROVIDER_REASONS=TERMINAL_PROVIDER_REASONS,
+        _TRANSIENT_PROVIDER_REASONS=TRANSIENT_PROVIDER_REASONS,
+    )
+    monkeypatch.setitem(sys.modules, "cli", stub)
+    return recovered
+
+
+def _quiet_stub_run_conversation(exc):
+    from types import SimpleNamespace
+
+    def fails(**_kwargs):
+        raise exc
+
+    return SimpleNamespace(agent=SimpleNamespace(run_conversation=fails, session_id="s-1"),
+                           conversation_history=[], session_id="s-1")
+
+
+def test_the_quiet_arm_parks_the_card_instead_of_exiting_nonzero(
+        board, monkeypatch, quiet_runner_seam):
+    """``-Q``: a receipt timeout becomes typed owner silence, the card parks, the worker exits 0."""
+    from hermes_cli import cli_single_query as csq
+
+    _running_task(board, "t1", 101)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "101")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", LOCK)
+
+    stub = _quiet_stub_run_conversation(WorkerReceiptTimeout("worker_receipt_timeout"))
+    with pytest.raises(SystemExit) as exc:
+        csq._run_quiet_single_query(stub, "hello")
+
+    assert exc.value.code == 0, (
+        "an owner-silent attempt is a host condition: the card parks and the dispatcher has "
+        "nothing to book. Letting the exception escape this arm would exit 1 and book it crashed")
+    task = board.execute("SELECT status, block_kind, consecutive_failures FROM tasks WHERE id='t1'").fetchone()
+    assert (task["status"], task["block_kind"], task["consecutive_failures"]) == ("blocked", "transient", 0)
+    assert quiet_runner_seam, "the typed result is what the recovery gate and the park both read"
+
+
+@pytest.mark.parametrize("code", NON_RECEIPT_STORE_CODES)
+def test_the_quiet_arm_re_raises_the_identical_non_receipt_failure(monkeypatch, quiet_runner_seam, code):
+    """``-Q``: every other store failure leaves the arm as the SAME exception object."""
+    from hermes_cli import cli_single_query as csq
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    failure = WorkerPersistenceError(code)
+    with pytest.raises(WorkerPersistenceError) as raised:
+        csq._run_quiet_single_query(_quiet_stub_run_conversation(failure), "hello")
+
+    assert raised.value is failure
+    assert raised.value.args == (code,)
+
+
+# ── the `-q` arm: the sibling call site, driven through the same seam ───────────────────────────
+#
+# `-Q` and `-q` each carry the one-line arm; pinning only one leaves the other free to widen its
+# `except` or lose the exception identity. `-q` is a 130-line function whose `cli` collaborator is
+# late-bound (`from cli import ...`), so the arm is reachable with a MagicMock `cli` plus a stub
+# facade module — no board, no provider, no turn.
+
+@pytest.fixture
+def chat_runner_seam(monkeypatch):
+    """The `-q` runner with its late-bound `cli` names replaced by a stub module."""
+    import sys
+    from types import SimpleNamespace
+
+    from hermes_cli import cli_single_query as csq
+    from hermes_cli.observability import shared_metrics_startup
+    from hermes_cli.turn_exit import TERMINAL_PROVIDER_REASONS, TRANSIENT_PROVIDER_REASONS
+
+    monkeypatch.setattr(ktr, "recover_failed_kanban_turns", lambda *args, **kwargs: None)
+    monkeypatch.setattr(shared_metrics_startup, "record_cli_one_shot_ready", lambda: None)
+    # The runner sets this itself (an `os.environ` write, not a monkeypatch one): seed it so the
+    # fixture's undo covers the write and no later test in this file inherits the marker.
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "0")
+    stub = SimpleNamespace(
+        _SeededQueryMessage=lambda *args, **kwargs: None,
+        _collect_kanban_task_images=lambda *args, **kwargs: [],
+        _collect_query_images=lambda query, image: (query, []),
+        _configure_quiet_agent=lambda *args, **kwargs: None,
+        _finalize_single_query=lambda *args, **kwargs: None,
+        _route_single_query_images=lambda cli, query, original, images, urls: query,
+        _run_kanban_goal_loop_chat=lambda *args, **kwargs: None,
+        _run_quiet_single_query=lambda *args, **kwargs: None,
+        _should_seed_interactive=lambda *args, **kwargs: False,
+        _single_query_exit_code=csq._single_query_exit_code,
+        _TERMINAL_PROVIDER_REASONS=TERMINAL_PROVIDER_REASONS,
+        _TRANSIENT_PROVIDER_REASONS=TRANSIENT_PROVIDER_REASONS,
+    )
+    monkeypatch.setitem(sys.modules, "cli", stub)
+    return stub
+
+
+def _failing_chat_cli(exc):
+    from unittest.mock import MagicMock
+
+    cli = MagicMock()
+    cli.session_id = "s-1"
+    cli.model = "test-model"
+    cli._claim_active_session = lambda *args, **kwargs: True
+    cli._last_turn_result = None
+    cli.chat.side_effect = exc
+    return cli
+
+
+def test_the_chat_arm_parks_a_receipt_timeout_instead_of_exiting_nonzero(
+        board, monkeypatch, chat_runner_seam):
+    """`-q`: the same one-line arm, the same outcome — typed owner silence, card parked, exit 0."""
+    from hermes_cli import cli_single_query as csq
+
+    _running_task(board, "t1", 101)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "101")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", LOCK)
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+
+    cli = _failing_chat_cli(WorkerReceiptTimeout("worker_receipt_timeout"))
+    with pytest.raises(SystemExit) as exc:
+        csq._run_single_query_mode(cli, "hello", None, False, False)
+
+    assert exc.value.code == 0, (
+        "the arm handed the typed result to the park path; exiting 1 here re-books the run the "
+        "board has already settled")
+    assert cli._last_turn_result["failure_reason"] == OWNER_UNAVAILABLE_REASON
+    assert cli._last_turn_result["owner_parked"] is True
+    task = board.execute("SELECT status, block_kind FROM tasks WHERE id='t1'").fetchone()
+    assert (task["status"], task["block_kind"]) == ("blocked", "transient")
+
+
+@pytest.mark.parametrize("code", NON_RECEIPT_STORE_CODES)
+def test_the_chat_arm_re_raises_the_identical_non_receipt_failure(
+        monkeypatch, chat_runner_seam, code):
+    """`-q`: every other store failure escapes this arm as the SAME exception object."""
+    from hermes_cli import cli_single_query as csq
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    failure = WorkerPersistenceError(code)
+    with pytest.raises(WorkerPersistenceError) as raised:
+        csq._run_single_query_mode(_failing_chat_cli(failure), "hello", None, False, False)
+
+    assert raised.value is failure
+    assert raised.value.args == (code,)

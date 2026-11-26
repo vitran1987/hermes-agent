@@ -923,6 +923,51 @@ def cmd_repair(args) -> int:
     return 0
 
 
+def cmd_republish_source(args) -> int:
+    """Publish core source bytes into the selected generation (the sanctioned writer of
+    ``installs/*/workspace/**`` for a code-only core fix -- see ``pm.republish``)."""
+    import json as _json
+
+    from pm.paths import repo_root
+    from pm.republish import republish_source
+
+    project = Path(args.project).resolve() if args.project else repo_root()
+    plan = republish_source(
+        project,
+        source=Path(args.source).resolve() if args.source else None,
+        workspace=Path(args.workspace).resolve() if args.workspace else None,
+        only=tuple(args.only or ()),
+        prune=args.prune,
+        verify=args.verify,
+        check=args.check,
+        allow_dirty=args.allow_dirty,
+    )
+    if args.json:
+        print(_json.dumps(plan.as_dict(), indent=2))
+    else:
+        verb = "would publish" if args.check else "published"
+        print(f"{verb} into {plan.workspace}")
+        print(f"  created={len(plan.created)} updated={len(plan.updated)} unchanged={plan.unchanged} "
+              f"stale={len(plan.stale)} pruned={len(plan.pruned)} ({plan.duration_ms} ms)")
+        for label, rows in (("created", plan.created), ("updated", plan.updated),
+                            ("stale", plan.stale), ("pruned", plan.pruned)):
+            for row in rows[:20]:
+                print(f"  {label:8s} {row}")
+            if len(rows) > 20:
+                print(f"  {label:8s} ... {len(rows) - 20} more")
+        if not plan.provenance_checked:
+            print("  provenance: NOT checked (source is not a git work tree or git status failed)")
+        elif plan.dirty:
+            print(f"  provenance: {len(plan.dirty)} touched path(s) uncommitted in the source checkout")
+        if plan.journal:
+            print(f"  journal: {plan.journal}")
+        if plan.stale:
+            print("  stale files stay until `--prune` (a source deletion is not a code-only delta)")
+    if args.check:
+        return 1 if plan.pending else 0
+    return 0
+
+
 def _extra_requirements(project: Path, extras: list[str]) -> list[str]:
     """The pinned requirements of declared extras, self-references expanded.
 
@@ -1052,6 +1097,36 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("repair", help="rebuild the recorded dependency environment without changing its graph")
     p.set_defaults(func=cmd_repair)
+
+    p = sub.add_parser(
+        "republish-source",
+        help="publish core source bytes into the selected generation (no dependency rebuild)",
+        description="Mirror the build inputs of a core checkout into the selected generation's "
+                    "workspace -- the one sanctioned writer of installs/*/workspace/**, for a "
+                    "code-only core fix that leaves the venv stamp identical. Atomic per file, "
+                    "journaled, verified; never touches the generation's own pyproject.toml, "
+                    "uv.lock or plugin snapshots. Prints what changed; exits 1 with --check when "
+                    "the workspace is stale.")
+    p.add_argument("--check", action="store_true",
+                   help="report the difference and write nothing (exit 1 when the workspace is stale)")
+    p.add_argument("--only", action="append", default=[], metavar="PATH",
+                   help="publish only this path (or directory prefix); repeatable. A delivery card "
+                        "names its file list; an unmatched PATH is an error")
+    p.add_argument("--prune", action="store_true",
+                   help="also delete files the source no longer has inside the snapshot's own directories")
+    p.add_argument("--verify", action="store_true",
+                   help="content-compare every file, not only the ones whose size/mtime differ (slow)")
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="publish paths that are uncommitted in the source checkout (default: refuse)")
+    p.add_argument("--source", type=Path, metavar="PATH",
+                   help="the core checkout to read (default: this checkout)")
+    p.add_argument("--project", type=Path, metavar="PATH",
+                   help="the install whose selected generation receives the bytes (default: this checkout)")
+    p.add_argument("--workspace", type=Path, metavar="PATH",
+                   help="an explicit generation workspace instead of the selected one (careful: bypasses "
+                        "the selection re-check)")
+    p.add_argument("--json", action="store_true", help="machine-readable plan on stdout")
+    p.set_defaults(func=cmd_republish_source)
 
     p = sub.add_parser(
         "environment", help="make a named side environment current and print its python",

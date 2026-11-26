@@ -88,20 +88,68 @@ def _published_store_entries(directory: Path) -> frozenset[str]:
 
 _ROOT_DATA_DIRS = frozenset({"locales", "skills", "optional-skills", "plugin-catalog", "optional-mcps"})
 
+# Build inputs a generation owns once it exists: ``pyproject.toml`` is regenerated with the
+# workspace members, ``uv.lock`` is resolved (seeded from core's), ``core-uv.lock`` records what
+# core's lock held. Re-snapshotting source over them breaks the member graph, so a source
+# refresh never writes them.
+GENERATION_OWNED = frozenset({"pyproject.toml", "uv.lock", "core-uv.lock"})
 
-def _copy_core_inputs(source: Path, destination: Path) -> None:
-    """Build from a writable snapshot, never from signed/read-only source."""
-    import fnmatch
+_CORE_EXCLUDED = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "release"})
+# A root dist/ is build output, but below a package root it is shipped: the managed
+# environment runs from this snapshot and serves bundled plugins' dashboard/dist/.
+_CORE_NESTED_EXCLUDED = _CORE_EXCLUDED - {"dist"}
+
+
+def _core_input_ignored(directory, names) -> list[str]:
+    """The build snapshot's exclusion rule for one directory level (copytree and os.walk share it)."""
+    published = _published_store_entries(Path(directory))
+    return [name for name in names if name in _CORE_NESTED_EXCLUDED or name.startswith(".")
+            or name in published or name.endswith(".egg-info") or (Path(directory) / name).is_symlink()]
+
+
+def _core_layout(source: Path) -> tuple[set[str], set[str]]:
+    """The two packaging facts the snapshot selection derives from: include roots and ``where`` roots."""
     import tomllib
 
     metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8-sig"))
-    project = metadata.get("project", {})
-    setuptools = metadata.get("tool", {}).get("setuptools", {})
-    find = setuptools.get("packages", {}).get("find", {})
+    find = metadata.get("tool", {}).get("setuptools", {}).get("packages", {}).get("find", {})
     patterns = find.get("include", ["*"])
     package_roots = {pattern.split(".", 1)[0] for pattern in patterns}
     # A ``where`` root (``src``) holds packages the include patterns name below it, not by its own name.
     where_roots = {Path(where).parts[0] for where in find.get("where", ["."]) if Path(where).parts}
+    return package_roots, where_roots
+
+
+def core_input_dirs(source: Path, *, exclude: Path | None = None) -> list[Path]:
+    """The top-level directories the build snapshot copies out of *source*.
+
+    Single source of truth for "what the build reads from core": ``_copy_core_inputs`` copies
+    exactly these (plus ``core_input_files``), and ``pm.republish`` re-snapshots exactly these,
+    so a publish can never drift from a rebuild.
+    """
+    import fnmatch
+
+    package_roots, where_roots = _core_layout(source)
+    skip = exclude.resolve() if exclude is not None else None
+    selected: list[Path] = []
+    for entry in sorted(source.iterdir()):
+        if not entry.is_dir() or entry.is_symlink() or entry.name in _CORE_EXCLUDED:
+            continue
+        if entry.name.startswith(".") or (skip is not None and entry.resolve() == skip):
+            continue
+        if (entry.name in where_roots
+                or entry.name in _ROOT_DATA_DIRS
+                or any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots)):
+            selected.append(entry)
+    return selected
+
+
+def core_input_files(source: Path) -> list[Path]:
+    """The root-level files the build snapshot copies out of *source* (packaging + root modules)."""
+    import tomllib
+
+    metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8-sig"))
+    project = metadata.get("project", {})
     files = {"pyproject.toml", "setup.py", "setup.cfg"}
     readme = project.get("readme")
     if isinstance(readme, str):
@@ -111,38 +159,50 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
     for pattern in project.get("license-files", []):
         files.update(str(p.relative_to(source)) for p in source.glob(pattern))
     files.update(p.name for p in source.glob("*.py"))
-
-    # uv.lock is not excluded: the root lock is never copied (only ``files`` are; lock_and_sync
-    # seeds or resolves it), and pm/uv.lock is the PM runtime's input (pm/runtime.py::_inputs).
-    excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "release"}
-    # A root dist/ is build output, but below a package root it is shipped: the managed
-    # environment runs from this snapshot and serves bundled plugins' dashboard/dist/.
-    nested_excluded = excluded - {"dist"}
-    def ignore(directory, names):
-        published = _published_store_entries(Path(directory))
-        return [name for name in names if name in nested_excluded or name.startswith(".")
-                or name in published or name.endswith(".egg-info") or (Path(directory) / name).is_symlink()]
-
-    # Runtime data dirs ride the same one-pass directory sweep: they are read beside the
-    # project root (agent/i18n.py, tools/skills_sync.py, hermes_cli/plugin_catalog.py,
-    # hermes_cli/mcp_catalog.py), not as package data, and are deliberately not setuptools
-    # packages. Naming them here keeps a single copy even when the include patterns (or their
-    # ["*"] default) already match — a second pass would collide with the copied directory.
-    for entry in source.iterdir():
-        if (entry.is_dir() and not entry.is_symlink() and entry.name not in excluded
-                and not entry.name.startswith(".") and entry.resolve() != destination.resolve()
-                and (entry.name in where_roots
-                     or entry.name in _ROOT_DATA_DIRS
-                     or any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots))):
-            target = destination / entry.name
-            shutil.copytree(entry, target, ignore=ignore)
-    for name in files:
+    selected: list[Path] = []
+    for name in sorted(files):
         entry = source / name
         if not entry.is_file() or entry.is_symlink():
             continue
         if not entry.resolve().is_relative_to(source.resolve()):
             raise InstallError("venv", f"build input escapes the core project: {name}")
-        target = destination / name
+        selected.append(entry)
+    return selected
+
+
+def iter_core_inputs(source: Path, *, exclude: Path | None = None):
+    """Yield ``(source file, path relative to the project root)`` for every build input.
+
+    The walk honours the same ignore rule ``copytree`` applies in ``_copy_core_inputs``, so a
+    caller that substitutes files one by one reproduces the snapshot byte for byte.
+    """
+    for directory in core_input_dirs(source, exclude=exclude):
+        for dirpath, dirnames, filenames in os.walk(directory):
+            ignored = set(_core_input_ignored(dirpath, dirnames + filenames))
+            dirnames[:] = [name for name in dirnames if name not in ignored]
+            for name in filenames:
+                if name in ignored:
+                    continue
+                path = Path(dirpath) / name
+                yield path, path.relative_to(source)
+    for path in core_input_files(source):
+        yield path, path.relative_to(source)
+
+
+def _copy_core_inputs(source: Path, destination: Path) -> None:
+    """Build from a writable snapshot, never from signed/read-only source."""
+    # uv.lock is not excluded: the root lock is never copied (only ``core_input_files`` are;
+    # lock_and_sync seeds or resolves it), and pm/uv.lock is the PM runtime's input (pm/runtime.py::_inputs).
+    #
+    # Runtime data dirs ride the same one-pass directory sweep: they are read beside the
+    # project root (agent/i18n.py, tools/skills_sync.py, hermes_cli/plugin_catalog.py,
+    # hermes_cli/mcp_catalog.py), not as package data, and are deliberately not setuptools
+    # packages. Naming them in ``core_input_dirs`` keeps a single copy even when the include
+    # patterns (or their ["*"] default) already match — a second pass would collide.
+    for directory in core_input_dirs(source, exclude=destination):
+        shutil.copytree(directory, destination / directory.name, ignore=_core_input_ignored)
+    for entry in core_input_files(source):
+        target = destination / entry.relative_to(source)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(entry, target)
 

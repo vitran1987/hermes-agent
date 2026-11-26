@@ -69,6 +69,10 @@ _NON_RECOVERABLE_REASONS = frozenset({
     FailoverReason.rate_limit.value,
     FailoverReason.billing.value,
     FailoverReason.upstream_rate_limit.value,
+    # The persistence OWNER stopped acknowledging receipts: the model was never the problem, so a
+    # re-entry can only fail again (and did -- three wasted turns before the dispatcher booked the
+    # same card crashed). The caller parks the card and exits clean instead. kanban t_56e39a6d.
+    FailoverReason.store_unavailable.value,
 })
 
 #: ``turn_exit_reason`` prefixes that mean the turn already went through a
@@ -320,6 +324,110 @@ def build_recovery_nudge(result: Any, *, attempt: int, max_attempts: int,
     )
 
 
+#: ``failure_reason`` for "the persistence owner stopped acknowledging this worker's receipts".
+#: Shared with ``hermes_cli/turn_exit.py`` (the exit-code policy) and stamped by the one-shot CLI.
+OWNER_UNAVAILABLE_REASON = "store_unavailable"
+
+#: The client-chrome line the dispatcher's host-side classifier keys on
+#: (``hermes_cli/kanban_db_dispatch.py::_HOST_SIDE_LOG_MARKERS``). A worker that reached it did not
+#: fail the card, so the phrase is part of the contract, not a log nicety.
+OWNER_SILENT_CHROME = "Kanban owner silent"
+
+
+def owner_unavailable_failure(result: Any) -> bool:
+    """True when a settled turn ended because its persistence OWNER stopped answering.
+
+    Typed first (``failure_reason``); the class name is the fallback for a turn that escaped the
+    classifier entirely, which is the other shape this one condition produces.
+    """
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("failure_reason") or "") == OWNER_UNAVAILABLE_REASON:
+        return True
+    return "WorkerReceiptTimeout" in str(result.get("error") or "")
+
+
+def park_owner_unavailable(
+    *, task_id: Optional[str] = None, detail: str = "", run_id: Optional[str] = None,
+    db_path: Optional[str] = None, emit: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Park THIS worker's card ``blocked(kind=transient)`` because the owner went silent.
+
+    The alternative -- the behaviour before this existed -- was a non-zero exit, which the dispatcher
+    books as a card crash and answers by re-spawning the task from scratch on work that is already
+    done (``t_caf39157`` ran 16 times like that). Parking states the truth on the board: the CARD is
+    fine, the HOST is not.
+
+    Written in-process against the board, exactly as ``cli_single_query._run_kanban_goal_loop_q``
+    blocks a stuck goal -- the owner RPC is what is broken here, so it cannot be the channel.
+    ``expected_run_id`` is REQUIRED (fail closed): without it a reclaimed card could be blocked under
+    a run this process no longer owns. Every failure path returns ``False`` so the caller can fall
+    back to ``KANBAN_TRANSIENT_OWNER_EXIT_CODE`` -- never to a plain exit 1.
+    """
+    task_id = _resolve_task_id(task_id)
+    pinned_run = str(run_id if run_id is not None else os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    reason = (
+        f"{OWNER_SILENT_CHROME}: the persistence owner stopped acknowledging this run's receipts "
+        "-- a host condition, not a failure of the card"
+    )
+    if detail:
+        reason = f"{reason} ({_truncate(detail, 160)})"
+    # The chrome line goes out BEFORE the board write: even when the park fails, the run's captured
+    # output must carry the phrase the dispatcher classifies as host-caused.
+    message = f"[kanban] {OWNER_SILENT_CHROME}: {task_id or 'task'} -- owner not answering receipts; parking the card"
+    logger.warning("%s", message)
+    if emit is not None:
+        try:
+            emit(message)
+        except Exception:
+            logger.debug("kanban owner-silent emit failed", exc_info=True)
+    if not task_id or not pinned_run.isdigit():
+        logger.warning("kanban owner-silent park: no pinned run id for %r -- not writing the board", task_id)
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as _kbc
+        conn = _kbc.connect(Path(db_path)) if db_path else _kbc.connect()
+        try:
+            blocked = _kb.block_task(
+                conn, task_id, reason=reason, kind="transient", expected_run_id=int(pinned_run),
+            )
+            if blocked:
+                _kb.add_comment(conn, task_id, "hermes-worker", (
+                    f"**{OWNER_SILENT_CHROME}** -- the persistence owner did not acknowledge this "
+                    f"run's receipts (run {pinned_run}). The card is parked `blocked`/`transient`.\n\n"
+                    "- No model failure took place: the turn died on the owner, not on the provider.\n"
+                    "- Nothing on disk was lost; work already written stays written.\n"
+                    "- Not charged to `failure_limit` -- this is a host condition.\n"
+                    "- Unblock once the gateway serving this profile is back."
+                ))
+            return bool(blocked)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("kanban owner-silent park failed for %s -- caller falls back to the sentinel", task_id,
+                       exc_info=True)
+        return False
+
+
+def park_if_owner_unavailable(
+    result: Any, *, emit: Optional[Callable[[str], None]] = None, task_id: Optional[str] = None,
+) -> bool:
+    """Park the card when *result* is an owner-silence failure; marks it ``owner_parked``.
+
+    ``owner_parked`` is what ``hermes_cli/turn_exit.py`` reads to exit 0: the board already holds the
+    terminal state, so any non-zero exit would re-book the same run as a crash.
+    """
+    if not owner_unavailable_failure(result):
+        return False
+    detail = str(result.get("error") or "") if isinstance(result, dict) else ""
+    if not park_owner_unavailable(task_id=task_id, detail=detail, emit=emit):
+        return False
+    if isinstance(result, dict):
+        result["owner_parked"] = True
+    return True
+
+
 def _emit_recovery_skipped(emit: Optional[Callable[[str], None]], task_id: Optional[str] = None) -> None:
     """The one "no proof, no retry" line — fail-closed is worth saying out loud."""
     message = (
@@ -392,11 +500,16 @@ def recover_failed_kanban_turns(
 
 __all__ = [
     "DEFAULT_MAX_RECOVERY_ATTEMPTS",
+    "OWNER_SILENT_CHROME",
+    "OWNER_UNAVAILABLE_REASON",
     "RECOVERY_DELAYS_SECONDS",
     "build_recovery_nudge",
     "kanban_task_id",
     "kanban_turn_recovery_enabled",
     "max_recovery_attempts",
+    "owner_unavailable_failure",
+    "park_if_owner_unavailable",
+    "park_owner_unavailable",
     "recover_failed_kanban_turns",
     "recovery_delay_seconds",
     "should_recover_turn",

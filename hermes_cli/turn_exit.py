@@ -7,6 +7,13 @@ Worker identity is supplied by the caller, not inferred from a daemon's environm
 TRANSIENT_PROVIDER_REASONS = frozenset({
     "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",
 })
+# The persistence OWNER stopped answering this worker's receipts. A host condition, handled by the
+# board's own ``owner_unavailable`` taxonomy (``kanban_db_dispatch._exit_code_kind``): the run is
+# booked ``owner_lost`` -- re-admitted without spending the card's failure budget -- instead of
+# ``crashed``. A plain exit 1 here is what re-spawned already-merged work (kanban t_56e39a6d).
+OWNER_UNAVAILABLE_REASON = "store_unavailable"
+TRANSIENT_OWNER_REASONS = frozenset({OWNER_UNAVAILABLE_REASON})
+
 # These failures need an operator change; the dispatcher parks the task immediately.
 TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
@@ -17,6 +24,7 @@ def turn_exit_code(
     result, *, kanban_worker: bool, credentials_rate_limited: bool = False,
     credentials_terminal: bool = False,
     transient_reasons=TRANSIENT_PROVIDER_REASONS, terminal_reasons=TERMINAL_PROVIDER_REASONS,
+    transient_owner_reasons=TRANSIENT_OWNER_REASONS,
 ) -> int:
     """Preserve completion, interruption and retryable/terminal provider outcomes."""
     if not isinstance(result, dict):
@@ -29,10 +37,19 @@ def turn_exit_code(
         return 1
     if result.get("interrupted"):
         return 130
+    if kanban_worker and result.get("owner_parked") is True:
+        # The worker already wrote the terminal state on the board (``blocked``/``transient``)
+        # because the persistence owner stopped answering. A non-zero exit would make the
+        # dispatcher re-book this very run as a crash/host-loss and respawn it.
+        return 0
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if kanban_worker:
         reason = result.get("failure_reason")
+        if reason in transient_owner_reasons:
+            # The park itself did not land: still keep the host's fault off the card's budget.
+            from hermes_cli.kanban_db import KANBAN_TRANSIENT_OWNER_EXIT_CODE
+            return KANBAN_TRANSIENT_OWNER_EXIT_CODE
         if reason in transient_reasons:
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
             return KANBAN_RATE_LIMIT_EXIT_CODE

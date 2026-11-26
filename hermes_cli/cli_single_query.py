@@ -180,6 +180,69 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     )
 
 
+def _owner_unavailable_result(exc) -> dict:
+    """Typed terminal result for a turn the persistence owner abandoned.
+
+    Shaped like a classified failure so every downstream reader (turn report, recovery gate, exit
+    policy) keeps working, but the reason is ``store_unavailable``: not the model, and not something
+    a retry can heal.
+    """
+    from hermes_cli.turn_exit import OWNER_UNAVAILABLE_REASON
+    detail = str(exc) or type(exc).__name__
+    return {
+        "final_response": f"The persistence owner stopped acknowledging this run's receipts ({detail}).",
+        "messages": [], "api_calls": 0, "completed": False, "failed": True,
+        "error": f"{type(exc).__name__}: {detail}",
+        "failure_reason": OWNER_UNAVAILABLE_REASON, "failure_retryable": False,
+    }
+
+
+def _owner_silent_result(exc):
+    """Typed terminal result when *exc* is a RECEIPT timeout, else ``None``.
+
+    Only ``WorkerReceiptTimeout`` means "the persistence owner stopped acknowledging this run": the
+    owner is what broke, no model retry can heal it, and the card has to be parked rather than booked
+    as a crash. The rest of the ``WorkerPersistenceError`` family -- ``outbox_full``,
+    ``permission_denied``, ``unsupported_operation``, ``synchronous_self_rpc``, ``pending_receipt``
+    -- are ordinary store failures with their own pre-existing route. Rendering THEM as owner silence
+    would be the same false-cause class this whole change removes, one level down: measured on the
+    previous head, each of those codes produced "The persistence owner stopped acknowledging this
+    run's receipts (outbox_full)", carried ``failure_reason=store_unavailable`` and parked the card
+    blocked/transient with exit 0.
+
+    The type survives the store's sticky latch (``RuntimeSessionStore._latch_failure`` keeps
+    ``type(exc)`` for our own family), so a late call re-raises the same class and still lands here.
+    """
+    from agent.runtime_session_store import WorkerReceiptTimeout
+    if not isinstance(exc, WorkerReceiptTimeout):
+        return None
+    return _owner_unavailable_result(exc)
+
+
+def _owner_silent_or_reraise(exc) -> dict:
+    """``_owner_silent_result(exc)``, re-raising anything else unchanged.
+
+    This is the one line both single-query arms call, so the decision cannot drift between ``-Q``
+    and ``-q``: a receipt timeout becomes the typed owner-silence result, and every other failure --
+    including the rest of the ``WorkerPersistenceError`` family -- escapes as the SAME exception
+    object, exactly as before this change.
+    """
+    result = _owner_silent_result(exc)
+    if result is None:
+        raise exc
+    return result
+
+
+def _park_owner_silent(result, *, emit=None) -> bool:
+    """Park the card when *result* names an owner-silence failure. Never raises."""
+    from agent.kanban_turn_recovery import park_if_owner_unavailable
+    try:
+        return park_if_owner_unavailable(result, emit=emit)
+    except Exception:
+        logger.debug("kanban owner-silent park failed", exc_info=True)
+        return False
+
+
 def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
@@ -200,6 +263,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     turn_report_path = take_turn_report_path()
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
+        result = None
         try:
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
@@ -210,6 +274,11 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 exit_single_query(emitter.emit_result({"failed": True, "error": "Interrupted"}, session_id=cli.session_id or "", exit_code=130))
             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
             exit_single_query(130)
+        except Exception as _turn_exc:
+            # ONLY a receipt timeout is owner silence (see _owner_silent_or_reraise): every other
+            # persistence failure is re-raised unchanged, so this arm cannot mislabel it as "the
+            # owner stopped answering" and park the card on a false cause.
+            result = _owner_silent_or_reraise(_turn_exc)
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
@@ -236,6 +305,9 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             lambda: result,
             emit=lambda msg: print(msg, file=sys.stderr, flush=True),
         )
+        # A settled turn can also end on the owner without raising (the receipt budget expired
+        # inside a persistence call): park the card here so a dead owner never books a card crash.
+        _park_owner_silent(result, emit=lambda msg: print(msg, file=sys.stderr, flush=True))
         # The turn is over and persisted: the one-shot exit linger that follows protects nested
         # notify_on_complete replies and is NOT part of the spawner's delivery (#113608). The
         # report carries what this run will print, so a spawner booking a child still lingering
@@ -551,7 +623,14 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # the run (recovery and goal follow-ups included) carries it to memory providers.
         from agent.turn_author import take_turn_author_from_env
         cli._single_query_turn_author = take_turn_author_from_env()
-        response = cli.chat(query, images=single_query_images or None)
+        try:
+            response = cli.chat(query, images=single_query_images or None)
+        except Exception as _turn_exc:
+            # Same narrow contract as `-Q` (see _owner_silent_or_reraise): only a RECEIPT timeout
+            # becomes a typed result the park path below can settle; every other store failure is
+            # re-raised unchanged instead of being reported as a silent owner.
+            cli._last_turn_result = _owner_silent_or_reraise(_turn_exc)
+            response = ""
         # Kanban worker: a failed-silently turn used to end the run as rc=0 with no
         # terminal kanban call, so the dispatcher booked a protocol violation and
         # cold-restarted the task from scratch. Retry the authorised turn IN PLACE
@@ -570,6 +649,9 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             lambda: getattr(cli, "_last_turn_result", None),
             emit=lambda msg: print(msg, file=sys.stderr, flush=True),
         )
+        # Same post-recovery owner-silence contract as `-Q` (see _park_owner_silent).
+        _park_owner_silent(getattr(cli, "_last_turn_result", None),
+                           emit=lambda msg: print(msg, file=sys.stderr, flush=True))
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).

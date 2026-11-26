@@ -43,6 +43,7 @@ class FailoverReason(enum.Enum):
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    store_unavailable = "store_unavailable"  # The worker's persistence OWNER stopped answering receipts — an owner/host fault, NEVER the provider
     ssl_cert_verification = "ssl_cert_verification"  # Deterministic TLS chain failure — fail fast with guidance
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload
@@ -577,6 +578,12 @@ _V_SSL_CERT = _v(_R.ssl_cert_verification, **_ABORT_FALLBACK)
 _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
 _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
 _V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
+
+# The owner is unresponsive, not the model: an in-place model retry cannot heal it. ``retryable=False``
+# is load-bearing -- it stops the turn ladder, and ``kanban_turn_recovery.should_recover_turn`` refuses
+# the reason explicitly as well. It is deliberately NOT added to ``TRANSIENT_REASONS``: that set is the
+# provider-verdict set, and a dead owner must never be read as a provider being back.
+_V_STORE_UNAVAILABLE = _v(_R.store_unavailable, retryable=False)
 _V_IMAGE_TOO_LARGE, _V_IMAGE_CORRUPT = _v(_R.image_too_large), _v(_R.image_corrupt)
 _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported), _v(_R.invalid_encrypted_content)
 _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
@@ -1078,6 +1085,33 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
 
 
+def _by_persistence_failure(c: _Ctx) -> Optional[Verdict]:
+    """A receipt the persistence OWNER never acknowledged — matched by TYPE, never by name.
+
+    ``WorkerReceiptTimeout`` subclasses ``WorkerPersistenceError`` and its class name still contains
+    "Timeout", so ``_by_transport`` (which matches ``isinstance(TimeoutError)`` and any class name
+    containing "Timeout") read a dead owner as a provider read timeout and re-entered the model in
+    place three times. This stage runs BEFORE every status/message/transport heuristic so the type
+    wins; the cause chain is walked because a turn can wrap the error before the loop sees it.
+    """
+    try:
+        from agent.runtime_session_store import WorkerReceiptTimeout
+    except Exception:  # health: allow BLE001 -- classification must survive a broken store import
+        WorkerReceiptTimeout = None  # noqa: F841 - the name check below is the fallback
+
+    def _is(exc: Any) -> Any:
+        return True if WorkerReceiptTimeout is not None and isinstance(exc, WorkerReceiptTimeout) else None
+
+    # Fallback for a tree where the class cannot be imported: the class name is ours and unique, so
+    # the check cannot collide with an SDK error the way a bare "TimeoutError" name did.
+    def _named(exc: Any) -> Any:
+        return True if type(exc).__name__ == "WorkerReceiptTimeout" else None
+
+    if _from_cause_chain(c.error, _is, None) or _from_cause_chain(c.error, _named, None):
+        return _V_STORE_UNAVAILABLE
+    return None
+
+
 def _by_transport(c: _Ctx) -> Optional[Verdict]:
     """SSL, disconnect, circuit-breaker and transport-type heuristics, in that order."""
     msg = c.msg
@@ -1128,8 +1162,8 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
-    _by_error_code, _by_message, _by_transport,
+    _plugin_verdict, _profile_verdict, _by_persistence_failure, _provider_special_cases, _by_status,
+    _moa_special_cases, _by_error_code, _by_message, _by_transport,
 )
 
 
@@ -1179,7 +1213,11 @@ def _shape_context(c: _Ctx, verdict: Verdict, *, hooked: bool) -> dict[str, Any]
     ``should_fallback=False``), and for built-in verdicts ``quota_exhausted`` and ``route_rejects_model``."""
     extra: dict[str, Any] = {}
     reason = verdict["reason"]
-    if isinstance(c.error, TimeoutError) or "Timeout" in c.error_type or "timed out" in c.msg:
+    # ``WorkerReceiptTimeout`` carries "Timeout" in its NAME, but the owner never spoke to the
+    # provider: labelling it ``transport: timeout`` is what let the auxiliary client re-read a dead
+    # owner as a provider read timeout (kanban t_56e39a6d).
+    if reason is not _R.store_unavailable and (
+            isinstance(c.error, TimeoutError) or "Timeout" in c.error_type or "timed out" in c.msg):
         extra["transport"] = "timeout"
     elif (reason is _R.timeout and not c.status_code
           or any(p in c.msg for p in _SERVER_DISCONNECT_PATTERNS + _PREMATURE_CLOSE_PATTERNS + _CONNECTION_MESSAGE_PATTERNS)):

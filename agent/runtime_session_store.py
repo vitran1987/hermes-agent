@@ -47,6 +47,33 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class WorkerReceiptTimeout(WorkerPersistenceError):
+    """The OWNER (this runtime's gateway) did not answer a worker RPC inside its receipt budget.
+
+    The write's outcome is UNKNOWN, not failed: the owner may have applied it and lost only the
+    ACK. Nothing is ever resent on a missed receipt (an exact re-send resolves to the ORIGINAL
+    receipt), so waiting longer is safe -- but re-entering the MODEL is not: the owner is the thing
+    that stopped answering, and the model was never at fault.
+
+    A distinct TYPE is the only durable distinction. ``TimeoutError`` is also the name of a provider
+    connection timeout, and the error classifier matched it by name, so one stalled owner killed 7
+    workers in 5 seconds on 2026-11-26 -- each retried in place three times as if the model had
+    timed out, then exited non-zero and was booked a card crash (kanban t_56e39a6d). It inherits
+    ``WorkerPersistenceError`` so every existing caller, and the sticky-failure latch below, keeps
+    catching it.
+    """
+    pass
+
+
+#: Growing, bounded receipt budgets (seconds) for ONE worker RPC. The first window stays short so a
+#: healthy owner answers as fast as before, and the total must outlive the owner's own write
+#: patience (``SessionDB`` transcript writes are measured at 60 s) or a slow-but-alive owner can
+#: never answer in time -- measured on 2026-11-26: the owner's transcript row landed 12-18 s after
+#: the old single 20 s window had expired. The request is sent ONCE: each later window only waits
+#: again for the SAME request id, so a late receipt still resolves its original write.
+_RECEIPT_BUDGETS_S: tuple[float, ...] = (20.0, 30.0, 40.0)
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -109,7 +136,7 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            raise WorkerReceiptTimeout('worker_receipt_timeout') from None
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -169,6 +196,21 @@ class WorkerRPC:
         with self.lock:
             self._drop()
 
+    def _receive_receipt(self, link):
+        """Wait for ONE request's receipt across the growing, bounded budgets.
+
+        The request is already sent and its id is fixed, so a retry only WAITS again: a late
+        receipt still resolves the original write and nothing is duplicated. A single 20 s window
+        used to expire while the owner was still applying that very write.
+        """
+        for budget in _RECEIPT_BUDGETS_S[:-1]:
+            try:
+                return link.receive(budget)
+            except WorkerReceiptTimeout:
+                logger.warning('worker receipt missed its %ss window; waiting again for the same '
+                               'request (caller: %s)', budget, _caller_summary(limit=3))
+        return link.receive(_RECEIPT_BUDGETS_S[-1])
+
     def __call__(self, method, **params):
         try:
             asyncio.get_running_loop()
@@ -194,7 +236,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = self._receive_receipt(link)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -229,6 +271,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None
+        self.failure_type = None
         self.path = Path(outbox_dir) / 'pending.json'
         make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
@@ -267,6 +310,26 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         except Exception:
             self._outbox_owner.close()
             raise
+
+    def _latch_failure(self, exc):
+        """Remember a failure AND its type, never only its text.
+
+        Failure is sticky, so every later call re-raises the latched error. Keeping only
+        ``str(exc)`` re-raised a generic ``WorkerPersistenceError`` whose NAME says nothing about
+        the cause: the classifier read that as ``unknown`` -- retryable -- and a dead owner was
+        retried as if the provider had failed (kanban t_56e39a6d). Only our own family keeps its
+        type; a foreign exception still re-raises as ``WorkerPersistenceError`` exactly as before,
+        so callers that catch that class see no change.
+        """
+        self.failure = str(exc)
+        self.failure_type = type(exc) if isinstance(exc, WorkerPersistenceError) else WorkerPersistenceError
+
+    def _raise_latched(self):
+        raise (self.failure_type or WorkerPersistenceError)(self.failure)
+
+    def _clear_failure(self):
+        self.failure = None
+        self.failure_type = None
 
     def _reconcile_adopted(self, adopted):
         """Carry a retained outbox across verified owner replacement.
@@ -315,7 +378,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def _apply(self, operation, payload):
         with self.lock:
             if self.failure:
-                raise WorkerPersistenceError(self.failure)
+                self._raise_latched()
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
@@ -325,7 +388,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             try:
                 self._save(candidate)
             except Exception as exc:
-                self.failure = str(exc)
+                self._latch_failure(exc)
                 raise
             self.journal = candidate
             return self.retry_pending()[0]
@@ -344,9 +407,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
-                self.failure = str(exc)
+                self._latch_failure(exc)
                 raise
-            self.failure = None
+            self._clear_failure()
             return results
 
     def adopt(self, epoch):
@@ -356,7 +419,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self._save(candidate)
             self.scope = candidate['scope']
             self.journal = candidate
-            self.failure = None
+            self._clear_failure()
 
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
@@ -411,7 +474,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def flush_token_counts(self, timeout=5.0):
         with self.lock:
             if self.failure:
-                raise WorkerPersistenceError(self.failure)
+                self._raise_latched()
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
             return True

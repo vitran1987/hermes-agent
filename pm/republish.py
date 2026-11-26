@@ -37,8 +37,8 @@ Measured cost (2026-11-26, this Windows host, 7077-file / 83.9 MiB selection)
   **5.2 s**; a no-op re-run costs the same order (4-15 s, on-access-scanner noise);
 * worst case (empty workspace, every file copied): **111 s**;
 * the stamp-based alternative (hash the same set inside ``expected_stamp``, which runs on every
-  ``venv_is_current`` probe) measured **~530 s** for a full content hash, and even a stat-only
-  digest (~1.1 s) would tax every activation.
+  ``venv_is_current`` probe) measured **328 s** for a content hash over exactly this selection,
+  and even a stat-only digest (~1.1 s) would tax every activation.
 """
 
 from __future__ import annotations

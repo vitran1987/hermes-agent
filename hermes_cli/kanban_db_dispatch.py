@@ -80,9 +80,17 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)",
     re.IGNORECASE,
 )
+
+# A PR number is the identity of a PR; the URL is only one of the ways a comment
+# spells it. Ownership (``_own_pr_numbers``) is decided per NUMBER, so the guard
+# can tell "the PR this card owns" from "a PR this card merely mentions".
+_PR_TITLE_NUMBER_RE = re.compile(r"#(\d{2,})\b")
+_PR_KEY_RE = re.compile(r"^pr:(\d+)$", re.IGNORECASE)
+_PR_METADATA_KEYS = ("published_pr", "pr_url", "pr", "pr_number")
+
 
 
 @dataclass
@@ -1874,6 +1882,89 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _own_pr_numbers(conn: sqlite3.Connection, task_id: str) -> set[int]:
+    """PR numbers ``task_id`` OWNS, read from STRUCTURED fields only.
+
+    Rule 4 arms on a PR URL found in comment prose. Prose cannot distinguish
+    "the PR this card is about" from "the PR this card opened": every merge,
+    review, rebase and rework card cites its own PR, so the guard held exactly
+    the cards whose work was to finish that PR. Measured 2026-11-27: 113 of 153
+    denials in 24h (74%) were the owning card — ``t_378d2f92`` (#19355) was
+    denied 55 times, sat 21.6 h, and the PR went CONFLICTING.
+
+    Ownership therefore comes from the fields that RECORD it, in this order:
+
+    * ``tasks.completion_contract`` — an exact PR URL (``OWNER/REPO`` has no number)
+    * the completion handoff — ``published_pr`` / ``pr_url`` / ``pr`` / ``pr_number``
+      in the latest ``task_runs.metadata`` or ``completed`` event payload
+      (``tasks`` has no ``metadata`` column; the handoff is where it lands)
+    * ``tasks.idempotency_key`` — ``pr:<n>``
+    * ``tasks.title`` — ``#<n>`` (a card minted *for* a PR names it there)
+
+    A card with no structured owner (a fresh implementation card) returns an
+    empty set, so a foreign PR URL in its comments still arms the guard — the
+    duplicate-PR brake that protects the ~0.5% real title-collision class.
+    """
+    row = conn.execute(
+        "SELECT title, completion_contract, idempotency_key "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return set()
+
+    own: set[int] = set()
+
+    def _add(value: object) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool):
+            return
+        if isinstance(value, int):
+            if value > 0:
+                own.add(value)
+            return
+        text = _kb._lossy_text(value) or ""
+        url = _RESPAWN_GUARD_PR_URL_RE.search(text)
+        if url:
+            own.add(int(url.group(1)))
+            return
+        digits = text.strip().lstrip("#")
+        if digits.isdigit() and int(digits) > 0:
+            own.add(int(digits))
+
+    def _add_metadata(blob: object) -> None:
+        data = _kb._json_dict(blob)
+        if not isinstance(data, dict):
+            return
+        for key in _PR_METADATA_KEYS:
+            if key in data:
+                _add(data.get(key))
+        nested = data.get("metadata")
+        if isinstance(nested, (dict, str)):
+            nested = _kb._json_dict(nested) if isinstance(nested, str) else nested
+            if isinstance(nested, dict):
+                for key in _PR_METADATA_KEYS:
+                    if key in nested:
+                        _add(nested.get(key))
+
+    _add(row["completion_contract"])
+    for run in conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL "
+            "ORDER BY id DESC LIMIT 5", (task_id,)):
+        _add_metadata(run["metadata"])
+    for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "ORDER BY id DESC LIMIT 5", (task_id,)):
+        _add_metadata(event["payload"])
+    key_match = _PR_KEY_RE.match((row["idempotency_key"] or "").strip())
+    if key_match:
+        own.add(int(key_match.group(1)))
+    for match in _PR_TITLE_NUMBER_RE.finditer(_kb._lossy_text(row["title"]) or ""):
+        own.add(int(match.group(1)))
+    return own
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1959,14 +2050,28 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+    #    Only a PR the card does NOT own counts: a URL naming one of
+    #    ``_own_pr_numbers`` is this card's own work (finish/rebase/merge it), and
+    #    holding it is the false positive that starved the board (74% of 153
+    #    denials in 24h). A FOREIGN URL still arms — that is the duplicate-PR
+    #    brake. Exception: a handoff AFTER the newest foreign-PR comment (operator
+    #    reassign, reviewer changes_requested, review reopen) names the profile
+    #    that must now work on THAT PR — a closer or the implementer finishing it,
+    #    not a duplicate implementation (#111910). A crash/reclaim is not a
+    #    handoff, so the worker that opened the PR is still not re-spawned
+    #    against it.
+    own_pr_numbers = _own_pr_numbers(conn, task_id)
+    pr_times: list[int] = []
+    for t, comment in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+                                  cols=", body", unreadable=now):  # duplicate-PR risk: fail closed
+        cited = {int(n) for n in _RESPAWN_GUARD_PR_URL_RE.findall(
+            _kb._lossy_text(comment["body"]) or "")}
+        if not cited:
+            continue
+        if own_pr_numbers and cited <= own_pr_numbers:
+            # every PR this comment cites is the card's own — dispatch it.
+            continue
+        pr_times.append(t)
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed) -- a
         # same-second ``assigned`` may be a no-op reassign racing the comment.

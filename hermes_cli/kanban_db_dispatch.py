@@ -2165,7 +2165,15 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    # Stamp the breaker budget this run was dispatched under (``kanban.failure_limit``
+    # as resolved by THIS dispatcher) on the ``claimed`` event. The worker cannot
+    # re-derive it: it runs in the assignee's profile home, which resolves its own
+    # (usually unset → built-in 2) value, so an in-worker config read would book the
+    # iteration-budget exit against a limit the board never used.
+    claimed = claim(
+        conn, task_id, ttl_seconds=ttl_seconds,
+        event_extra={"failure_limit": failure_limit},
+    )
     if claimed is None:
         return False
     try:

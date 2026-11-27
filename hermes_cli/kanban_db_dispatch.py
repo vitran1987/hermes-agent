@@ -642,13 +642,24 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+    failure_limit: int | None = None,
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    ``failure_limit`` is the dispatcher's CONFIGURED breaker threshold
+    (``kanban.failure_limit``); omitting it silently fell back to
+    ``DEFAULT_FAILURE_LIMIT`` while still stamping ``limit_source: "dispatcher"``,
+    so a timeout tripped at 2 on a board configured for 4. ``None`` (direct
+    callers, tests) keeps the built-in default.
     """
     timed_out: list[str] = []
     now = int(time.time())
@@ -737,6 +748,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 conn, tid,
                 error=error,
                 outcome="timed_out",
+                failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
@@ -1240,7 +1252,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection,
+    crash_details: list,
+    *,
+    failure_limit: int | None = None,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
@@ -1248,6 +1265,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
     heal them) trip immediately.
+
+    ``failure_limit`` is the dispatcher's CONFIGURED threshold and is forwarded
+    from :func:`detect_crashed_workers`; ``None`` falls back to
+    ``DEFAULT_FAILURE_LIMIT`` for direct callers. The systemic branch keeps its
+    deliberate trip-at-1 (``sticky``) rule regardless of the configured value.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -1310,7 +1332,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                # Systemic wave: trip at 1 regardless of the configured budget
+                # (deliberate sticky hold for an operator). Otherwise the
+                # dispatcher's configured limit — never the built-in default.
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
@@ -1320,7 +1345,12 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+    *,
+    failure_limit: int | None = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -1329,10 +1359,17 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
+
+    ``failure_limit`` is the dispatcher's configured breaker threshold, applied
+    to ordinary crashes; ``None`` keeps ``DEFAULT_FAILURE_LIMIT`` for direct
+    callers.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(conn, sweep.crash_details, failure_limit=failure_limit)
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -1400,6 +1437,7 @@ def _record_task_failure(
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
     """
+    limit_from_caller = failure_limit is not None
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
@@ -1422,7 +1460,11 @@ def _record_task_failure(
         if task_override is not None:
             effective_limit, limit_source = int(task_override), "task"
         else:
-            effective_limit, limit_source = int(failure_limit), "dispatcher"
+            # ``default`` = no limit was supplied and the built-in default
+            # decided. Stamping ``dispatcher`` there made the audit payload
+            # report a configured limit the dispatcher never passed in.
+            effective_limit = int(failure_limit)
+            limit_source = "dispatcher" if limit_from_caller else "default"
 
         if infrastructure or not (force_trip or failures >= effective_limit):
             if release_claim:
@@ -2224,12 +2266,16 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
+    # Both reclaim paths book their failures against the CONFIGURED breaker
+    # budget (``kanban.failure_limit``), like ``release_stale_claims`` and
+    # ``recompute_ready`` beside them. Omitting it here silently reverted them
+    # to the built-in default of 2.
+    result.crashed = detect_crashed_workers(conn, board=board, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

@@ -180,6 +180,58 @@ def test_title_ownership_needs_the_pr_as_the_subject(kanban_home, title, expecte
         assert kbd._own_pr_numbers(conn, tid) == expected
 
 
+# --- bracketed PR designation (t_00a88dad review round 1) -------------------
+#
+# A leading ``[TAG]`` group can BE the designation: the live board 2026-11-28
+# carries 22 titles in that shape (``[PR #19415] ...``, ``[SEC][PR #19402]
+# [round-2] ...``, ``[MERGE][fork PR #25] ...``, ``[CI-RERUN][PR #19149,#19150]
+# ...``). Stripping every tag before looking for the subject dropped their only
+# ownership record, re-creating the very hold this card removes. A tag that
+# merely MENTIONS a number stays prose.
+
+@pytest.mark.parametrize("title, expected", [
+    ("[PR #19415] review + merge head-locked", {19415}),
+    ("[SEC][PR #19402][round-2] Verdict tai head", {19402}),
+    ("[MERGE][fork PR #25] retarget sang bangioi/main", {25}),
+    ("[CI-RERUN][PR #19149,#19150] validate-branch-strategy died",
+     {19149, 19150}),
+    ("[REWORK][R1][PR #18901] Complete W03 merge-authority cleanup", {18901}),
+    ("[follow-up][#19419] port the fix", {19419}),
+    ("[PR19413] no-hash no-space form", {19413}),
+    ("[PR17674-TRIAGE] Triage stale #17674", set()),
+    ("[FOLLOW-UP][RELEASE AFTER #18343 MERGES] switch the lane", set()),
+    ("[OPS][post-merge #19023] Re-register scheduled tasks", set()),
+    ("[REVIEW][AFTER-#18727] PR #18733 close-before-open", {18733}),
+    ("[P0][FIX-2] Orphan sweep still does not run", set()),
+    ("[REVIEW][15min cap][P0] PR #18861 fix transport", {18861}),
+])
+def test_bracketed_pr_designation_is_ownership(kanban_home, title, expected):
+    """A leading tag whose CONTENT is a PR designation records ownership; a tag
+    that only mentions a number does not."""
+    with kbc.connect() as conn:
+        tid = _card(conn, title=title)
+        assert kbd._own_pr_numbers(conn, tid) == expected
+
+
+def test_bracketed_title_does_not_arm_when_comment_cites_that_pr(kanban_home):
+    """The hold this card removes, in its bracketed-title form: the card owns the
+    PR in its leading tag and its comment cites that PR -> dispatch."""
+    with kbc.connect() as conn:
+        tid = _card(conn, title="[PR #19415] review + merge head-locked",
+                    pr_numbers=(19415,))
+        assert kbd._own_pr_numbers(conn, tid) == {19415}
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_bracketed_reference_tag_still_arms_on_a_foreign_pr(kanban_home):
+    """A reference-shaped tag must not license a foreign PR: brake intact."""
+    with kbc.connect() as conn:
+        tid = _card(conn, title="[OPS][post-merge #19023] Re-register tasks",
+                    pr_numbers=(19023,))
+        assert kbd._own_pr_numbers(conn, tid) == set()
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_pr_key_ownership_is_unchanged(kanban_home):
     """``idempotency_key = pr:<n>`` remains the primary ownership record."""
     with kbc.connect() as conn:

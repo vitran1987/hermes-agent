@@ -93,7 +93,20 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 # 2026-11-28, t_31f09963's title put the superseded PR #19405 into ``own`` while
 # the PR the card actually delivered (#19413) stayed outside it, so the guard held
 # a delivered card on a PR it never owned.
-_PR_TITLE_TAG_RE = re.compile(r"^(?:\s*\[[^\]]*\]\s*)+")
+#
+# Subject position has two spellings. A leading ``[TAG]`` group may BE the
+# designation (``[PR #19415] ...``, ``[SEC][PR #19402][round-2] ...``,
+# ``[MERGE][fork PR #25] ...``, ``[PR #19149,#19150] ...``) — 22 such titles on
+# the live board 2026-11-28 — or the PR may lead the text after any tags
+# (``[REVIEW][SEC] PR #19413 ...``). A tag that merely MENTIONS a number is prose
+# (``[AFTER-#18727]``, ``[post-merge #19023]``, ``[RELEASE AFTER #18343 MERGES]``,
+# ``[FIX][TEST] Post-#19405``) and owns nothing.
+_PR_TITLE_TAG_RE = re.compile(r"^\s*\[([^\]]*)\]")
+_PR_TITLE_TAG_DESIGNATION_RE = re.compile(
+    r"^(?:fork\s*)?(?:PR\s*#?\s*|#)\d{2,}(?:\s*[,/&]\s*#?\d{2,})*$",
+    re.IGNORECASE,
+)
+_PR_TITLE_TAG_NUMBER_RE = re.compile(r"\d{2,}")
 _PR_TITLE_OWNER_RE = re.compile(r"^\s*(?:#|PR\s*#?)(\d{2,})\b", re.IGNORECASE)
 _PR_KEY_RE = re.compile(r"^pr:(\d+)$", re.IGNORECASE)
 _PR_METADATA_KEYS = ("published_pr", "pr_url", "pr", "pr_number")
@@ -1892,16 +1905,32 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 def _title_pr_numbers(title: Optional[str]) -> set[int]:
     """PR numbers a title OWNS: ``#N`` / ``PR #N`` in SUBJECT position.
 
-    Leading ``[REVIEW][SEC]``-style tags are stripped first, so
-    ``[REVIEW][SEC] PR #19413 ...`` owns 19413. Anywhere else ``#N`` is prose
-    (``Post-#19405``, ``after #19405``) and prose never records ownership; the
-    fields that do are ``completion_contract``, the completion handoff metadata
-    and ``idempotency_key = pr:<n>``. A title that merely NAMES a PR therefore
-    neither grants nor removes ownership.
+    A leading ``[...]`` group may BE the designation
+    (``[PR #19413] ...``, ``[SEC][PR #19402][round-2] ...``,
+    ``[MERGE][fork PR #25] ...``, ``[PR #19149,#19150] ...``); after the tags the
+    PR may also lead the text (``[REVIEW][SEC] PR #19413 ...``). Anywhere else
+    ``#N`` is prose (``Post-#19405``, ``after #19405``) and prose never records
+    ownership; a tag that merely mentions a number is prose too
+    (``[AFTER-#18727]``, ``[post-merge #19023]``, ``[RELEASE AFTER #18343
+    MERGES]``). The fields that RECORD ownership are ``completion_contract``, the
+    completion handoff metadata and ``idempotency_key = pr:<n>``.
     """
-    body = _PR_TITLE_TAG_RE.sub("", title or "", count=1)
+    numbers: set[int] = set()
+    body = title or ""
+    while True:
+        tag = _PR_TITLE_TAG_RE.match(body)
+        if tag is None:
+            break
+        content = tag.group(1).strip()
+        if _PR_TITLE_TAG_DESIGNATION_RE.match(content):
+            numbers.update(
+                int(n) for n in _PR_TITLE_TAG_NUMBER_RE.findall(content)
+            )
+        body = body[tag.end():].lstrip()
     match = _PR_TITLE_OWNER_RE.match(body)
-    return {int(match.group(1))} if match else set()
+    if match:
+        numbers.add(int(match.group(1)))
+    return numbers
 
 
 def _own_pr_numbers(conn: sqlite3.Connection, task_id: str) -> set[int]:

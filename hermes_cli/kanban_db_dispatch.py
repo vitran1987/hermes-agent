@@ -87,7 +87,14 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 # A PR number is the identity of a PR; the URL is only one of the ways a comment
 # spells it. Ownership (``_own_pr_numbers``) is decided per NUMBER, so the guard
 # can tell "the PR this card owns" from "a PR this card merely mentions".
-_PR_TITLE_NUMBER_RE = re.compile(r"#(\d{2,})\b")
+#
+# ``#N`` in a TITLE is an ownership record only when the title makes the PR its
+# SUBJECT. "Post-#19405 hardening" / "after #19405" NAME a reference: measured
+# 2026-11-28, t_31f09963's title put the superseded PR #19405 into ``own`` while
+# the PR the card actually delivered (#19413) stayed outside it, so the guard held
+# a delivered card on a PR it never owned.
+_PR_TITLE_TAG_RE = re.compile(r"^(?:\s*\[[^\]]*\]\s*)+")
+_PR_TITLE_OWNER_RE = re.compile(r"^\s*(?:#|PR\s*#?)(\d{2,})\b", re.IGNORECASE)
 _PR_KEY_RE = re.compile(r"^pr:(\d+)$", re.IGNORECASE)
 _PR_METADATA_KEYS = ("published_pr", "pr_url", "pr", "pr_number")
 
@@ -1882,6 +1889,21 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _title_pr_numbers(title: Optional[str]) -> set[int]:
+    """PR numbers a title OWNS: ``#N`` / ``PR #N`` in SUBJECT position.
+
+    Leading ``[REVIEW][SEC]``-style tags are stripped first, so
+    ``[REVIEW][SEC] PR #19413 ...`` owns 19413. Anywhere else ``#N`` is prose
+    (``Post-#19405``, ``after #19405``) and prose never records ownership; the
+    fields that do are ``completion_contract``, the completion handoff metadata
+    and ``idempotency_key = pr:<n>``. A title that merely NAMES a PR therefore
+    neither grants nor removes ownership.
+    """
+    body = _PR_TITLE_TAG_RE.sub("", title or "", count=1)
+    match = _PR_TITLE_OWNER_RE.match(body)
+    return {int(match.group(1))} if match else set()
+
+
 def _own_pr_numbers(conn: sqlite3.Connection, task_id: str) -> set[int]:
     """PR numbers ``task_id`` OWNS, read from STRUCTURED fields only.
 
@@ -1899,7 +1921,9 @@ def _own_pr_numbers(conn: sqlite3.Connection, task_id: str) -> set[int]:
       in the latest ``task_runs.metadata`` or ``completed`` event payload
       (``tasks`` has no ``metadata`` column; the handoff is where it lands)
     * ``tasks.idempotency_key`` — ``pr:<n>``
-    * ``tasks.title`` — ``#<n>`` (a card minted *for* a PR names it there)
+    * ``tasks.title`` — ``#<n>`` / ``PR #<n>`` as the title SUBJECT (a card
+      minted *for* a PR names it there); a title that only NAMES a PR
+      (``Post-#<n>``, ``after #<n>``) grants nothing
 
     A card with no structured owner (a fresh implementation card) returns an
     empty set, so a foreign PR URL in its comments still arms the guard — the
@@ -1960,8 +1984,7 @@ def _own_pr_numbers(conn: sqlite3.Connection, task_id: str) -> set[int]:
     key_match = _PR_KEY_RE.match((row["idempotency_key"] or "").strip())
     if key_match:
         own.add(int(key_match.group(1)))
-    for match in _PR_TITLE_NUMBER_RE.finditer(_kb._lossy_text(row["title"]) or ""):
-        own.add(int(match.group(1)))
+    own |= _title_pr_numbers(_kb._lossy_text(row["title"]))
     return own
 
 
@@ -2050,11 +2073,15 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Only a PR the card does NOT own counts: a URL naming one of
-    #    ``_own_pr_numbers`` is this card's own work (finish/rebase/merge it), and
-    #    holding it is the false positive that starved the board (74% of 153
-    #    denials in 24h). A FOREIGN URL still arms — that is the duplicate-PR
-    #    brake. Exception: a handoff AFTER the newest foreign-PR comment (operator
+    #    A comment that cites ANY PR the card owns is this card's own work
+    #    (finish/rebase/merge it), and holding it is the false positive that
+    #    starved the board (74% of 153 denials in 24h; 227 events in 4 h on
+    #    2026-11-28). Citing an ADDITIONAL, foreign PR in the same comment does
+    #    not change that: "port to the fork, open the upstream PR" names two
+    #    numbers for ONE work item. A comment whose PRs are ALL foreign — and
+    #    any comment on a card with no structured owner — still arms: that is
+    #    the duplicate-PR brake. Exception: a handoff AFTER the newest foreign-PR
+    #    comment (operator
     #    reassign, reviewer changes_requested, review reopen) names the profile
     #    that must now work on THAT PR — a closer or the implementer finishing it,
     #    not a duplicate implementation (#111910). A crash/reclaim is not a
@@ -2068,8 +2095,12 @@ def check_respawn_guard(
             _kb._lossy_text(comment["body"]) or "")}
         if not cited:
             continue
-        if own_pr_numbers and cited <= own_pr_numbers:
-            # every PR this comment cites is the card's own — dispatch it.
+        if own_pr_numbers and (cited & own_pr_numbers):
+            # AT LEAST ONE cited PR is the card's own — dispatch it. Requiring
+            # every cited number (``cited <= own``) held any card whose comment
+            # paired a fork PR with the upstream PR (measured 2026-11-28: 227
+            # ``respawn_guarded{active_pr}`` events in 4 h on 2 cards, one of them
+            # live work).
             continue
         pr_times.append(t)
     if pr_times:
